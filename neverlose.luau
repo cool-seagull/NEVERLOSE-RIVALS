@@ -1,4 +1,71 @@
+-- Neverlose
+if game.GameId~=6035872082 then warn("[Neverlose for RIVALS] This script only supports RIVALS");return end
+local source=[=====[
+-- Neverlose
 
+-- BEGIN GENERATED STARTUP GUARD
+local STARTUP_SOURCE=[====[
+-- Read-only startup checks. Never require a controller while the native loader owns it.
+local M={universeId=6035872082}
+local function find(root,path)
+ for part in path:gmatch('[^/]+')do root=root and root:FindFirstChild(part)end
+ return root
+end
+function M.probe()
+ if game.GameId~=0 and game.GameId~=M.universeId then return nil,'wrong game' end
+ if not game:IsLoaded()then return nil,'Roblox loading' end
+ if game.GameId~=M.universeId then return nil,'wrong game' end
+ local p=game:GetService('Players').LocalPlayer
+ local ps=p and p:FindFirstChild('PlayerScripts');local pg=p and p:FindFirstChild('PlayerGui')
+ if not (ps and pg and workspace.CurrentCamera)then return nil,'waiting for player/camera' end
+ -- The same native ScreenGui moves from its module into PlayerGui, then is destroyed
+ -- after Close() finishes. Check both locations, including the closing blur effect.
+ local rf=game:GetService('ReplicatedFirst')
+ if find(rf,'Root/LoadingScreen/LoadingScreen')or pg:FindFirstChild('LoadingScreen')or game:GetService('Lighting'):FindFirstChild('LoadingScreen')then return nil,'RIVALS loading screen' end
+ local gui=pg:FindFirstChild('MainGui');if not gui then return nil,'waiting for game interface' end
+ local rs=game:GetService('ReplicatedStorage')
+ local token={ps,pg,gui,workspace.CurrentCamera}
+ local fighter=find(ps,'Controllers/FighterController')
+ if fighter then
+  for _,spec in ipairs({
+   {ps,'Controllers/FighterController'},{ps,'Controllers/CameraController'},
+   {ps,'Controllers/MechanicsController'},{ps,'Modules/ClientReplicatedClasses/ClientFighter/ClientItem/ClientViewModel'},
+   {ps,'Modules/ItemTypes/Gun'},{rs,'Modules/ItemLibrary'},{rs,'Modules/CosmeticLibrary'},{rs,'Modules/Utility'},
+  })do
+   local dependency=find(spec[1],spec[2]);if not dependency then return nil,'waiting for game modules' end
+   table.insert(token,dependency)
+  end
+ else
+  for _,path in ipairs({'Modules/Client/Controllers/GunController','Modules/Client/Controllers/CameraController','Modules/Client/CameraPOV','Assets/Operators/Operator1'})do
+   local dependency=find(rs,path);if not dependency then return nil,'waiting for game modules' end
+   table.insert(token,dependency)
+  end
+ end
+ return token,'ready'
+end
+function M.same(a,b)
+ if not a or not b or #a~=#b then return false end
+ for i,v in ipairs(a)do if v~=b[i]then return false end end
+ return true
+end
+function M.wait(timeout,cancel)
+ local deadline=os.clock()+(timeout or 180);local stable,since;local reason
+ repeat
+  if cancel and cancel()then return false,'cancelled' end
+  local token;token,reason=M.probe()
+  if reason=='wrong game'then return false,reason end
+  if not M.same(token,stable)then stable,since=token,os.clock()end
+  if token and os.clock()-(since or os.clock())>=2 then return true end
+  task.wait(.25)
+ until os.clock()>=deadline
+ return false,'Timed out waiting for '..tostring(reason)
+end
+return M
+]====]
+local Startup=assert(loadstring(STARTUP_SOURCE,"Neverlose for RIVALS / Startup"))()
+local startupReady,startupReason=Startup.wait(180)
+if not startupReady then warn("[Neverlose for RIVALS] "..tostring(startupReason));return end
+-- END GENERATED STARTUP GUARD
 local cloneref = cloneref or function(o) return o end
 local Players = cloneref(game:GetService("Players"))
 local TweenService = cloneref(game:GetService("TweenService"))
@@ -407,6 +474,8 @@ return function(connect,cleanups,getValue,isMenuOpen)
  local mechanics=requireAt(controllers,'MechanicsController')
  local playerData=requireAt(controllers,'PlayerDataController')
  local enemies=requireAt(controllers,'EnemyController')
+ local duels=requireAt(controllers,'DuelController')
+ local duelLibrary=requireAt(RS,'Modules/DuelLibrary')
  local items=requireAt(RS,'Modules/ItemLibrary')
  local cosmetics=requireAt(RS,'Modules/CosmeticLibrary')
  local utility=requireAt(RS,'Modules/Utility')
@@ -420,6 +489,12 @@ return function(connect,cleanups,getValue,isMenuOpen)
  if not (fc and camera and items and vmClass and gunClass and utility) then error('Fighter runtime is not ready; re-execute after the client loads.') end
  local A={native=true,name='Fighter1076',thirdPerson=false,targetGroups={Head={'Head'},Body={'Body'}},skinChoices={'Original'},weaponChoices={},modelChoices={}}
  A.defaultFov=camera._base_fov
+ A.mapChoices={'Select a map'}
+ A.mapVoteSupported=duels~=nil and duelLibrary~=nil
+ if duelLibrary and type(duelLibrary.Maps)=='table'then
+  local names={};for name in pairs(duelLibrary.Maps)do if type(name)=='string'then table.insert(names,name)end end
+  table.sort(names);for _,name in ipairs(names)do table.insert(A.mapChoices,name)end
+ end
  local diagnostics={adapter=A.name,errors=0,skin='Original',skinApplications=0,seedSupported=false}
  local stopped=false
  local function atGameIdentity(fn)
@@ -1170,7 +1245,7 @@ return function(connect,cleanups,getValue,isMenuOpen)
   if stopped or binding then return end;binding=true
   local ok,err=pcall(function()atGameIdentity(bind)end)
   binding=false
-  if not ok then diagnostics.errors=diagnostics.errors+1;diagnostics.lastError=tostring(err);if diagnostics.errors==1 then warn('[Neverlose adapter] '..tostring(err))end end
+  if not ok then diagnostics.errors=diagnostics.errors+1;diagnostics.lastError=tostring(err);if diagnostics.errors==1 then warn('[Neverlose for RIVALS adapter] '..tostring(err))end end
  end)
  table.insert(cleanups,function()atGameIdentity(function()
   clear(itemCleanup);clear(fighterCleanup);if quietOwned then camera._shake_enabled=gameSetting('Camera Shake',originalShake)end
@@ -1207,6 +1282,30 @@ return function(connect,cleanups,getValue,isMenuOpen)
  end
  function A.nativeItem()return item()end
  function A.nativeFighter()return localFighter()end
+ local function mapVoteSnapshot()
+  local duel=duels and duels:GetDuel(player)
+  local dueler=duel and not duel._destroyed and duel:GetDueler(player)
+  if not dueler then return nil end
+  local voting=duel.DuelInterface and duel.DuelInterface.Voting
+  return {duel=duel,options=duel:Get('VoteOptions'),kind=duel:Get('VoteOptionsType'),mode=duel:Get('VoteSelectionMode'),lastVote=dueler:Get('LastVote'),open=voting and voting:IsOpen()==true}
+ end
+ function A.mapVoteSnapshot()return atGameIdentity(mapVoteSnapshot)end
+ function A.voteMap(name)
+  return atGameIdentity(function()
+   local vote=mapVoteSnapshot()
+   if not(vote and vote.open and vote.kind=='Maps'and type(vote.options)=='table')then return false,'not voting for maps' end
+   if tostring(vote.mode):lower():find('ban',1,true)then return false,'map banning phase' end
+   for _,option in pairs(vote.options)do
+    if option.Name==name then
+     if option.IsBanned then return false,'map banned' end
+     if vote.lastVote==name then return true,'already voted' end
+     RS.Remotes.Duels.Vote:FireServer(name) -- The exact request used by the native map button.
+     return true,'requested'
+    end
+   end
+   return false,'preferred map unavailable'
+  end)
+ end
  function A.character()local f=localFighter();return f and f.Entity and f.Entity.Model end
  refresh(true);atGameIdentity(bind);atGameIdentity(enforceAvatar)
  return A
@@ -2477,7 +2576,7 @@ return function(menuGui, Store, connect, cleanups, adapter)
   local okChams,errChams=pcall(updateChams,r,ctx,cam,now,detail,onScreen,dead)
   if not okChams then
    chamsOff(r); stats.errors+=1; detail.chamsError=tostring(errChams)
-   if stats.lastError~=tostring(errChams) then stats.lastError=tostring(errChams); warn('[Neverlose ESP] chams: '..tostring(errChams)) end
+   if stats.lastError~=tostring(errChams) then stats.lastError=tostring(errChams); warn('[Neverlose for RIVALS ESP] chams: '..tostring(errChams)) end
   end
   if not onScreen then
    detail.reason='off screen'
@@ -2660,7 +2759,7 @@ return function(menuGui, Store, connect, cleanups, adapter)
    if not ok then
     r.ui.Visible=false; chamsOff(r)
     stats.errors+=1
-    if stats.lastError~=tostring(err) then stats.lastError=tostring(err); warn('[Neverlose ESP] '..tostring(err)) end
+    if stats.lastError~=tostring(err) then stats.lastError=tostring(err); warn('[Neverlose for RIVALS ESP] '..tostring(err)) end
    end
    if ok and (r.clone or next(r.surfaces)) then stats.chamsTargets+=1 end
   end
@@ -3651,7 +3750,7 @@ return function(Store,connect,cleanups,isMenuOpen,notify,adapter)
   scanning=false
   if not ok then
    state.errors+=1;state.lastError=tostring(result);state.phase='error'
-   if state.errors==1 then warn('[Neverlose Ragebot] '..state.lastError) end
+   if state.errors==1 then warn('[Neverlose for RIVALS Ragebot] '..state.lastError) end
    return nil
   end
   return result
@@ -3781,7 +3880,7 @@ return function(Store,connect,cleanups,isMenuOpen,notify,adapter)
    pending=false
    if stopped then return end
    local ok,err=pcall(step)
-   if not ok then release();state.errors+=1;state.lastError=tostring(err);state.phase='error';if state.errors==1 then warn('[Neverlose Ragebot] '..state.lastError) end end
+   if not ok then release();state.errors+=1;state.lastError=tostring(err);state.phase='error';if state.errors==1 then warn('[Neverlose for RIVALS Ragebot] '..state.lastError) end end
   end)
  end)
  table.insert(cleanups,function() stopped=true;release();table.clear(records) end)
@@ -3935,7 +4034,7 @@ return function(Store,connect,cleanups,isMenuOpen,adapter)
  Run:BindToRenderStep('NeverloseLegitAim',Enum.RenderPriority.Camera.Value-1,function(dt)
   if stopped then return end
   local ok,err=pcall(step,dt)
-  if not ok then clear('error');state.errors=state.errors+1;state.lastError=tostring(err);if state.errors==1 then warn('[Neverlose Legitbot] '..state.lastError)end end
+  if not ok then clear('error');state.errors=state.errors+1;state.lastError=tostring(err);if state.errors==1 then warn('[Neverlose for RIVALS Legitbot] '..state.lastError)end end
  end)
  table.insert(cleanups,function()stopped=true;clear('unloaded');Run:UnbindFromRenderStep('NeverloseLegitAim');overlay:Destroy()end)
  return {status=function()local copy=table.clone(state);if state.target then copy.target=table.clone(state.target)end;return copy end}
@@ -4293,7 +4392,7 @@ return function(getValue,connect,cleanups,isMenuOpen,adapter)
  connect(Run.Heartbeat,function()
   if stopped then return end
   local good,err=pcall(function()native(update)end)
-  if not good then state.errors=state.errors+1;state.lastError=tostring(err);if state.errors==1 then warn('[Neverlose movement] '..tostring(err))end end
+  if not good then state.errors=state.errors+1;state.lastError=tostring(err);if state.errors==1 then warn('[Neverlose for RIVALS movement] '..tostring(err))end end
  end)
  table.insert(cleanups,function()
   stopped=true
@@ -4310,125 +4409,140 @@ end
 
 end)()
 
+local installAutoVote = (function()
+-- Prefer one native map option. Never vote during weapon voting or map banning.
+return function(getValue,connect,cleanups,adapter)
+ local state={supported=adapter and adapter.mapVoteSupported==true or false,phase='disabled',requests=0,errors=0}
+ local function status()return table.clone(state)end
+ if not state.supported then state.phase='unavailable';return {status=status}end
+ local stopped=false;local nextCheck=0;local ballots=setmetatable({},{__mode='k'})
+ local function step()
+  if getValue('Main/Automation/Auto Vote')~=true then state.phase='disabled';return end
+  local selected=getValue('Main/Automation/Preferred Map')
+  state.map=selected
+  if type(selected)~='string'or selected==''or selected=='Select a map'then state.phase='choose a map';return end
+  local vote=adapter.mapVoteSnapshot()
+  if not vote then state.phase='waiting for duel';return end
+  if not(vote.open and vote.kind=='Maps'and type(vote.options)=='table')then ballots[vote.duel]=nil;state.phase='waiting for map vote';return end
+  if tostring(vote.mode):lower():find('ban',1,true)then state.phase='map banning phase';return end
+  local names={};local choice
+  for _,option in pairs(vote.options)do
+   table.insert(names,option.Name)
+   if option.Name==selected then choice=option end
+  end
+  table.sort(names);local key=tostring(vote.mode)..'/'..table.concat(names,'\0')
+  local ballot=ballots[vote.duel]
+  if not ballot or ballot.key~=key then ballot={key=key,sent={}};ballots[vote.duel]=ballot end
+  if not choice then state.phase='preferred map unavailable';return end
+  if choice.IsBanned then state.phase='map banned';return end
+  if vote.lastVote==selected then state.phase='voted';ballot.sent[selected]={confirmed=true};return end
+  local sent=ballot.sent[selected]
+  if sent and sent.confirmed then state.phase='vote completed';return end
+  if sent and (sent.attempts>=2 or os.clock()-sent.at<1.5)then state.phase='waiting for vote confirmation';return end
+  local accepted,reason=adapter.voteMap(selected)
+  if accepted then
+   ballot.sent[selected]={attempts=(sent and sent.attempts or 0)+1,at=os.clock(),confirmed=reason=='already voted'}
+   if reason=='requested'then state.requests=state.requests+1 end
+   state.phase=reason=='already voted'and 'voted'or 'vote requested'
+  else state.phase=reason or 'vote unavailable' end
+ end
+ connect(game:GetService('RunService').Heartbeat,function()
+  if stopped or os.clock()<nextCheck then return end
+  nextCheck=os.clock()+.25
+  local ok,err=pcall(step)
+  if not ok then state.errors=state.errors+1;state.phase='error';state.lastError=tostring(err);if state.errors==1 then warn('[Neverlose for RIVALS Auto Vote] '..tostring(err))end end
+ end)
+ table.insert(cleanups,function()stopped=true;state.phase='unloaded';table.clear(ballots)end)
+ return {status=status}
+end
+
+end)()
+
 local installAutoExecute = (function()
--- Queue a local loader for server transfers; a disabled flag cancels our queued work.
-local QUEUE_VERSION=2
+-- Requeue once per server; wait for the game's own loader without requiring its modules.
+local QUEUE_VERSION=3
 local BOOTSTRAP=[=[
 task.spawn(function()
  local env=getgenv()
- if env.NeverloseMenu then return end
- local root='neverlose_ui'
- local http=game:GetService('HttpService')
+ local Startup=(function()
+__STARTUP_SOURCE__
+ end)()
+ if game.GameId~=0 and game.GameId~=Startup.universeId then return end
+ local job=game.JobId or 'local'
+ local function hasMenu()
+  local m=env.NeverloseMenu
+  if not m then return false end
+  if m._jobId and m._jobId~=job then return false end
+  if type(m.isAlive)=='function'then local ok,alive=pcall(m.isAlive);return ok and alive==true end
+  return true
+ end
+ if hasMenu()then return end
+ local root='neverlose_ui';local http=game:GetService('HttpService')
  local function state()
   local ok,value=pcall(function()return http:JSONDecode(readfile(root..'/autoexecute.json'))end)
   return ok and type(value)=='table'and value or nil
  end
  local settings=state()
- if not (settings and settings.enabled)then return end
- local lockDeadline=os.clock()+180
- while env.NeverloseAutoExecuteStarting do
+ if not(settings and settings.enabled and settings.universeId==Startup.universeId)then return end
+ local deadline=os.clock()+180
+ while type(env.NeverloseAutoExecuteStarting)=='table'and env.NeverloseAutoExecuteStarting.job==job and (env.NeverloseAutoExecuteStarting.expires or 0)>os.clock()do
   settings=state()
-  if env.NeverloseMenu or not (settings and settings.enabled)then return end
-  if os.clock()>=lockDeadline then warn('[Neverlose Auto Execute] An earlier startup did not finish');return end
+  if hasMenu()or not(settings and settings.enabled)then return end
+  if os.clock()>=deadline then warn('[Neverlose for RIVALS Auto Execute] Another startup did not finish');return end
   task.wait(.25)
  end
- if env.NeverloseMenu then return end
- env.NeverloseAutoExecuteStarting=true
+ if hasMenu()then return end
+ local owner={job=job,expires=deadline}
+ env.NeverloseAutoExecuteStarting=owner
+ -- The queue that brought us here has been consumed. The new menu must queue the next hop.
+ env.NeverloseAutoExecuteQueued=nil;env.NeverloseAutoExecuteQueueVersion=nil
+ env.NeverloseAutoExecuteBootStatus={phase='waiting for native loading screen'}
  local ok,err=xpcall(function()
-  local deadline=os.clock()+180
-  local stable,stableSince,attempts=nil,0,0
-  local function resolve(root,path)
-   for part in path:gmatch('[^/]+')do root=root and root:FindFirstChild(part)end
-   return root
-  end
-  local function runtimeReady()
-   if not game:IsLoaded()or not workspace.CurrentCamera then return nil end
-   local player=game:GetService('Players').LocalPlayer
-   local ps=player and player:FindFirstChild('PlayerScripts')
-   local rs=game:GetService('ReplicatedStorage')
-   local module=resolve(ps,'Controllers/FighterController')
-   if module then
-    local modules={module}
-    for _,spec in ipairs({
-     {ps,'Controllers/CameraController'},{ps,'Controllers/MechanicsController'},
-     {ps,'Modules/ClientReplicatedClasses/ClientFighter/ClientItem/ClientViewModel'},
-     {ps,'Modules/ItemTypes/Gun'},
-     {rs,'Modules/ItemLibrary'},{rs,'Modules/CosmeticLibrary'},{rs,'Modules/Utility'},
-    })do
-     local dependency=resolve(spec[1],spec[2])
-     if not dependency then return nil end
-     table.insert(modules,dependency)
-    end
-    local identity=getthreadidentity and getthreadidentity()
-    if setthreadidentity then setthreadidentity(2)end
-    local loaded,token=pcall(function()
-     local values={}
-     for i,dependency in ipairs(modules)do
-      values[i]=require(dependency)
-      if type(values[i])~='table'then return nil end
-     end
-     local f,camera=values[1].LocalFighter,values[2]
-     if not (values[1].Objects and camera.CameraState and camera.Rotation)then return nil end
-     if not f then return values[1]end -- Initialized lobby, before a fighter is assigned.
-     local e=f and f.Entity
-     if not (e and e.Model and e.Model.Parent and e.RootPart and e.Humanoid and e.Visibility)then return nil end
-     return e.Model
-    end)
-    if setthreadidentity and identity then setthreadidentity(identity)end
-    return loaded and token or nil
+  for attempt=1,3 do
+   local ready,why=Startup.wait(math.max(0,deadline-os.clock()),function()
+    settings=state()
+    return hasMenu()or not(settings and settings.enabled and settings.universeId==Startup.universeId)
+   end)
+   if not ready then
+    if why=='cancelled'or why=='wrong game'then return end
+    error(why,0)
    end
-   -- A partially streamed Fighter folder must not be mistaken for the old engine.
-   for _,path in ipairs({'Modules/Client/Controllers/GunController','Modules/Client/Controllers/CameraController','Modules/Client/CameraPOV','Assets/Operators/Operator1'})do
-    if not resolve(rs,path)then return nil end
-   end
-   return player and player.Character
-  end
-  repeat
    settings=state()
-   if not (settings and settings.enabled)or env.NeverloseMenu then return end
-   if game:IsLoaded()and game.GameId~=settings.universeId then return end
-   local token=runtimeReady()
-   if token~=stable then stable,stableSince=token,os.clock()end
-   if token and os.clock()-stableSince>=1 then
-    local source=readfile(root..'/autoexecute.lua')
-    local chunk,why=loadstring(source,'Neverlose Auto Execute')
-    assert(chunk,why)
-    env.NeverloseMenuSource=source
-    env.NeverloseTeleportValues=settings.values
-    local started,result=pcall(chunk)
-    if started and env.NeverloseMenu then return end
-    attempts=attempts+1
-    local message=tostring(result or 'Menu startup did not finish')
-    local transient=message:find('runtime is not ready',1,true)or message:find('not a valid member',1,true)or message:find('attempt to index nil',1,true)
-    if not transient or attempts>=3 then error(message,0)end
-    stable,stableSince=nil,os.clock()
-   end
-   task.wait(.25)
-  until os.clock()>=deadline
-  error('The game client did not become ready within 180 seconds',0)
+   if hasMenu()or not(settings and settings.enabled)then return end
+   local source=readfile(root..'/autoexecute.lua')
+   local chunk,problem=loadstring(source,'Neverlose for RIVALS / Auto Execute');assert(chunk,problem)
+   env.NeverloseMenuSource=source;env.NeverloseTeleportValues=settings.values
+   env.NeverloseAutoExecuteBootStatus.phase='starting menu'
+   local started,result=pcall(chunk)
+   if started and hasMenu()then return end
+   local message=tostring(result or 'Menu startup did not finish')
+   local transient=message:find('runtime is not ready',1,true)or message:find('not a valid member',1,true)or message:find('attempt to index nil',1,true)
+   if not transient or attempt==3 or os.clock()>=deadline then error(message,0)end
+  end
  end,debug.traceback)
- env.NeverloseAutoExecuteStarting=nil
- if not ok then warn('[Neverlose Auto Execute] '..tostring(err))end
+ if env.NeverloseAutoExecuteStarting==owner then env.NeverloseAutoExecuteStarting=nil end
+ env.NeverloseAutoExecuteBootStatus={phase=hasMenu()and 'ready'or ok and 'cancelled'or 'error',error=not ok and tostring(err)or nil}
+ if not ok then warn('[Neverlose for RIVALS Auto Execute] '..tostring(err))end
 end)
 ]=]
-return function(api,connect,cleanups,env,root)
+return function(api,connect,cleanups,env,root,startupSource)
  local player=game:GetService('Players').LocalPlayer
  local http=game:GetService('HttpService')
  local path='Settings/Menu/Auto Execute'
  local queue=queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)or (fluxus and fluxus.queue_on_teleport)
- local stopped=false
- local revision=0
- local cachedSource
+ local stopped=false;local revision=0;local cachedSource
  local status={supported=type(queue)=='function',enabled=false,queued=env.NeverloseAutoExecuteQueued==true,errors=0}
  local function persist(enabled)
-  writefile(root..'/autoexecute.json',http:JSONEncode({version=1,enabled=enabled,universeId=game.GameId,values=api.snapshot()}))
+  writefile(root..'/autoexecute.json',http:JSONEncode({version=2,enabled=enabled,universeId=6035872082,values=api.snapshot()}))
  end
  local function prepare()
   if stopped then return false end
   status.enabled=api.get(path)==true
   local ok,err=pcall(function()
    if status.enabled then
+    assert(game.GameId==6035872082,'Auto Execute only supports RIVALS')
     assert(status.supported,'This executor does not support queue_on_teleport')
+    assert(type(startupSource)=='string','Startup guard source is missing; run the current loader')
     if type(env.NeverloseMenuSource)=='string'and env.NeverloseMenuSource~=cachedSource then
      writefile(root..'/autoexecute.lua',env.NeverloseMenuSource);cachedSource=env.NeverloseMenuSource
     end
@@ -4436,14 +4550,14 @@ return function(api,connect,cleanups,env,root)
    end
    persist(status.enabled)
    if status.enabled and (not env.NeverloseAutoExecuteQueued or env.NeverloseAutoExecuteQueueVersion~=QUEUE_VERSION)then
-    assert(queue(BOOTSTRAP)~=false,'The executor rejected the teleport queue request')
-    env.NeverloseAutoExecuteQueued=true
-    env.NeverloseAutoExecuteQueueVersion=QUEUE_VERSION
+    local bootstrap=BOOTSTRAP:gsub('__STARTUP_SOURCE__',function()return startupSource end)
+    assert(queue(bootstrap)~=false,'The executor rejected the teleport queue request')
+    env.NeverloseAutoExecuteQueued=true;env.NeverloseAutoExecuteQueueVersion=QUEUE_VERSION
    end
    status.queued=env.NeverloseAutoExecuteQueued==true
   end)
   if not ok then
-   status.errors+=1;status.lastError=tostring(err);status.enabled=false
+   status.errors=status.errors+1;status.lastError=tostring(err);status.enabled=false
    pcall(persist,false)
    if api.get(path)==true then api.set(path,false)end
    api.notify('Auto Execute',tostring(err))
@@ -4452,24 +4566,22 @@ return function(api,connect,cleanups,env,root)
  end
  local changed=api.onAnyChanged(function(changedPath)
   if stopped then return end
-  revision+=1
+  revision=revision+1
   if changedPath==path then prepare()
   elseif api.get(path)==true then
    local pending=revision
-   task.delay(.2,function()
-    if not stopped and pending==revision then prepare()end
-   end)
+   task.delay(.2,function()if not stopped and pending==revision then prepare()end end)
   end
  end)
- connect(player.OnTeleport,function(state)
-  if state==Enum.TeleportState.Failed then
-   env.NeverloseAutoExecuteQueued=nil;env.NeverloseAutoExecuteQueueVersion=nil;status.queued=false
-  elseif state==Enum.TeleportState.Started or state==Enum.TeleportState.InProgress then
+ connect(player.OnTeleport,function(event)
+  if event==Enum.TeleportState.Started or event==Enum.TeleportState.InProgress then prepare()
+  elseif event==Enum.TeleportState.Failed then
+   -- A failed teleport does not consume the executor's queued script.
    prepare()
   end
  end)
  table.insert(cleanups,function()
-  stopped=true;revision+=1;changed:Disconnect();status.enabled=false
+  stopped=true;revision=revision+1;changed:Disconnect();status.enabled=false
   pcall(persist,false)
  end)
  prepare()
@@ -6557,6 +6669,13 @@ local function main()
 			title = "Posture",
 			rows = {
 				{ "toggle", "Fake Crouch", false, gear = true, nativeOnly = true },
+			},
+		},
+		{
+			title = "Automation",
+			rows = {
+				{ "toggle", "Auto Vote", false, nativeOnly = true, supported = gameAdapter and gameAdapter.mapVoteSupported == true },
+				{ "dropdown", "Preferred Map", gameAdapter and gameAdapter.mapChoices or { "Select a map" }, 1, nativeOnly = true, supported = gameAdapter and gameAdapter.mapVoteSupported == true },
 			},
 		},
 	})
@@ -8719,6 +8838,7 @@ print("Watermark is", menu.get("Main/Interface/Watermark") and "on" or "off")
 	api.legitbot = installLegitbot(Store, connect, cleanups, function() return menuOpen end, gameAdapter)
 	api.antiaim = installAntiAim(getValue, connect, cleanups, function() return menuOpen end, function(title, body) notify(title, body) end, gameAdapter)
 	api.movement = installMovement(getValue, connect, cleanups, function() return menuOpen end, gameAdapter)
+	api.autovote = installAutoVote(getValue, connect, cleanups, gameAdapter)
 	if gameAdapter then api.models=installCustomModels(pages.models,gameAdapter,getValue,connect,cleanups,function()return menuOpen end,function(title,body)notify(title,body)end)end
 
 	-- reload the last used config, if any
@@ -8855,7 +8975,9 @@ print("Watermark is", menu.get("Main/Interface/Watermark") and "on" or "off")
 		end
 	end
 	env.NeverloseMenu = api
-	api.autoexecute = installAutoExecute(api, connect, cleanups, env, ROOT)
+	api._jobId = game.JobId
+	api.isAlive = function() return gui.Parent ~= nil and not gui:GetAttribute("Unloaded") end
+	api.autoexecute = installAutoExecute(api, connect, cleanups, env, ROOT, STARTUP_SOURCE)
 	env.NeverloseTeleportValues = nil
 	return api
 end
@@ -8915,3 +9037,9 @@ if not started then
 	error(result,0)
 end
 return result
+]=====]
+local env=getgenv()
+env.NeverloseMenuSource=source
+local chunk,err=loadstring(source,"Neverlose for RIVALS")
+assert(chunk,err)
+return chunk()
