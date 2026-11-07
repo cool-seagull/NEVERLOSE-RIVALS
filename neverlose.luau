@@ -450,6 +450,62 @@ local ShieldGuard=(function()
  end
  return M
 end)()
+local CataloguePreview=(function()
+ local M={}
+ function M.build(asset,wrapController,wrap,inverted,collection)
+  assert(asset and asset:IsA('Model'),'Weapon model assets are not ready')
+  local copy=assert(asset:Clone(),'Weapon model could not be cloned');copy.Name='WeaponPreview'
+  local properties;local disposed=false
+  local function dispose()
+   if disposed then return end;disposed=true
+   -- Native animated wrap objects have their own connections and need explicit disposal.
+   for _,entry in pairs(properties or {})do
+    for _,object in pairs(entry.Cleanup or {})do pcall(function()object:Destroy()end)end
+    for _,child in pairs(entry.OriginalChildren or {})do if not child.Parent then pcall(function()child:Destroy()end)end end
+   end
+   properties=nil
+  end
+  local ok,err=pcall(function()
+   for _,child in ipairs(copy:GetChildren())do
+    local contexts=child:GetAttribute('AnimationContexts');local idle=false
+    if type(contexts)=='string'then for context in contexts:gmatch('[^,]+')do if context:match('^%s*(.-)%s*$')=='Idle'then idle=true end end end
+    if type(contexts)=='string'and not idle then child:Destroy()end
+   end
+   -- Bare Fists stores its visible hands in the helper rig instead of a weapon body.
+   local helper=copy:FindFirstChild('_fake');local bodyVisible=false
+   for _,node in ipairs(copy:GetDescendants())do
+    if node:IsA('BasePart')and node.Transparency<1 and not(helper and node:IsDescendantOf(helper))then bodyVisible=true;break end
+   end
+   if helper and not bodyVisible then
+    for _,name in ipairs({'LeftArm','RightArm'})do
+     local hand=helper:FindFirstChild(wrap and wrap~='Original'and name..'Wrapped'or name)or helper:FindFirstChild(name..'Wrapped')or helper:FindFirstChild(name)
+     if hand then hand.Parent=copy end
+    end
+   end
+   if helper then helper:Destroy()end
+   local visible=0
+   for _,node in ipairs(copy:GetDescendants())do
+    if node:IsA('BasePart')then
+     node.Anchored=true;node.CanCollide=false;node.CanTouch=false;node.CanQuery=false;node.LocalTransparencyModifier=0
+     if node.Transparency<1 then visible=visible+1 end
+    elseif node:IsA('LuaSourceContainer')or node:IsA('Sound')or node:IsA('ParticleEmitter')or node:IsA('Light')or node:IsA('JointInstance')or node:IsA('Constraint')then node:Destroy()end
+   end
+   assert(visible>0,'Weapon model has no visible preview parts')
+   if wrap and wrap~='Original'then
+    assert(wrapController,'Weapon finishes are not ready')
+    properties=wrapController:RecordOriginalWrapProperties(copy)
+    wrapController:ApplyWrap(properties,{Name=wrap,Inverted=inverted==true})
+   end
+   local nodes=copy:GetDescendants();table.insert(nodes,copy)
+   for _,node in ipairs(nodes)do for _,tag in ipairs(collection:GetTags(node))do collection:RemoveTag(node,tag)end end
+   local bounds=copy:GetBoundingBox();copy:PivotTo(CFrame.new(-bounds.Position)*copy:GetPivot())
+   copy.Destroying:Connect(dispose)
+  end)
+  if not ok then dispose();copy:Destroy();error(err,0)end
+  return copy,dispose
+ end
+ return M
+end)()
 return function(connect,cleanups,getValue,isMenuOpen)
  local Players=game:GetService('Players')
  local RS=game:GetService('ReplicatedStorage')
@@ -474,6 +530,7 @@ return function(connect,cleanups,getValue,isMenuOpen)
  local mechanics=requireAt(controllers,'MechanicsController')
  local playerData=requireAt(controllers,'PlayerDataController')
  local enemies=requireAt(controllers,'EnemyController')
+ local wrapController=requireAt(controllers,'WrapController')
  local duels=requireAt(controllers,'DuelController')
  local duelLibrary=requireAt(RS,'Modules/DuelLibrary')
  local items=requireAt(RS,'Modules/ItemLibrary')
@@ -997,7 +1054,7 @@ return function(connect,cleanups,getValue,isMenuOpen)
  diagnostics.modelSkins=modelCount;diagnostics.weapons=#A.weaponChoices
  function A.createVisual(base,modelName,clientItem)
   local current=item();local original=current and current.ViewModel
-  if not original then error('Equip a weapon before loading the skin preview.')end
+  if not original then error('The equipped viewmodel is not ready.')end
   if not table.find(A.modelChoices[base] or {},modelName)then error('This skin does not belong to '..tostring(base))end
   local owner=clientItem or setmetatable({Name=base,Info=items.Items[base],ClientFighter=localFighter()},{__index=current})
   local encoded={[original:ToEnum('Name')]=modelName}
@@ -1008,28 +1065,12 @@ return function(connect,cleanups,getValue,isMenuOpen)
  end
  function A.preview(base,modelName,wrap,inverted)
   return atGameIdentity(function()
-  if modelName=='Original' then modelName=base end
-  local vm=A.createVisual(base,modelName)
-  local copy
-  local ok,err=pcall(function()
-   vm.GetWrap=function()return wrap and wrap~='Original' and {Name=wrap,Inverted=inverted==true} or nil end
-   vm:_UpdateWrap()
-   copy=vm.Model:Clone();copy.Name='WeaponPreview'
-   for _,part in ipairs(copy:GetDescendants())do if part:IsA('BasePart')then part.Anchored=true;part.CanCollide=false;part.CanQuery=false;part.CanTouch=false end end
-   for _,child in ipairs(copy:GetChildren())do
-    if child:IsA('BasePart')then
-     for _,sub in ipairs(child:GetChildren())do if sub:IsA('Model')then sub.Parent=copy end end
-     child:Destroy()
-    elseif not child:IsA('Model')then child:Destroy()end
-   end
-   for _,node in ipairs(copy:GetDescendants())do
-    if node:IsA('LuaSourceContainer') or node:IsA('Sound') or node:IsA('ParticleEmitter') or node:IsA('Light') or node.Name=='_fake' then node:Destroy()end
-   end
-   local cf=copy:GetBoundingBox();copy:PivotTo(CFrame.new(-cf.Position)*copy:GetPivot())
-  end)
-  vm:Destroy()
-  if not ok then if copy then copy:Destroy()end;error(err,0)end
-  return copy
+   modelName=modelName=='Original'and base or modelName
+   assert(modelName==base or table.find(A.modelChoices[base]or {},modelName),'This skin does not belong to '..tostring(base))
+   if wrap and wrap~='Original'then assert(cosmetics and cosmetics.Cosmetics[wrap]and cosmetics.Cosmetics[wrap].WrapGroups,'Weapon finish is not available')end
+   local folder=ps:FindFirstChild('Assets');folder=folder and folder:FindFirstChild('ViewModels')
+   local asset=folder and utility:LookThrough(folder,modelName)
+   return CataloguePreview.build(asset,wrapController,wrap,inverted,Collection)
   end)
  end
  local function restoreVisual()
@@ -1345,10 +1386,15 @@ return function(page,adapter,Store,connect,cleanups,getValue,isMenuOpen)
  hint.TextXAlignment=Enum.TextXAlignment.Center
  local status=label('',119,12,Color3.fromRGB(147,181,207));status.TextXAlignment=Enum.TextXAlignment.Center
  local model,signature,pending,stopped=nil,nil,false,false
+ local disposeModel,requestedKey;local retryAt,failures=0,0
  local yaw,pitch,zoom=-.45,.12,1
  local radius=3;local drag=false;local lastMouse
  local generation=0
- local diagnostics={builds=0,errors=0,parts=0}
+ local diagnostics={builds=0,errors=0,parts=0,retries=0,phase='idle'}
+ local function releaseModel()
+  if disposeModel then pcall(disposeModel);disposeModel=nil end
+  if model then model:Destroy();model=nil end
+ end
  local function selection()
   local weapon=Store.contexts.skins
   return weapon,getValue('Skin Changer/Local/Model') or 'Original',getValue('Skin Changer/Local/Wrap') or 'Original',getValue('Skin Changer/Local/Inverted')==true
@@ -1356,21 +1402,28 @@ return function(page,adapter,Store,connect,cleanups,getValue,isMenuOpen)
  local function rebuild()
   local weapon,skin,wrap,inverted=selection()
   local key=tostring(weapon)..'|'..skin..'|'..wrap..'|'..tostring(inverted)
-  if key==signature or pending then return end
-  signature=key;pending=true;generation=generation+1;local ticket=generation
+  if key~=requestedKey then requestedKey=key;generation=generation+1;retryAt=0;failures=0 end
+  if model and not model.Parent then releaseModel();signature=nil end
+  if key==signature and model then status.Visible=false;diagnostics.phase='ready';return end
+  if pending or os.clock()<retryAt then return end
+  pending=true;local ticket=generation;diagnostics.phase='loading'
   title.Text=skin=='Original' and weapon or skin
   subtitle.Text=weapon..'   /   '..(wrap=='Original' and 'Original finish' or wrap)..(inverted and '  ·  Inverted' or '')
   status.Text='Loading model...';status.Visible=true
   task.spawn(function()
-   local ok,result=pcall(adapter.preview,weapon,skin,wrap,inverted)
+   local ok,result,dispose=pcall(adapter.preview,weapon,skin,wrap,inverted)
    pending=false
-   if stopped or ticket~=generation then if ok then result:Destroy()end;return end
-   if not ok then diagnostics.errors=diagnostics.errors+1;diagnostics.lastError=tostring(result);status.Text='Preview unavailable for this model';return end
-   if model then model:Destroy()end;model=result;model.Parent=world
+   if stopped or ticket~=generation then if dispose then pcall(dispose)end;if ok and result then result:Destroy()end;return end
+   if not ok then
+    failures=failures+1;retryAt=os.clock()+math.min(.5*2^(failures-1),5)
+    diagnostics.errors=diagnostics.errors+1;diagnostics.retries=diagnostics.retries+1;diagnostics.lastError=tostring(result);diagnostics.phase='waiting for assets'
+    status.Text='Waiting for model assets...';return
+   end
+   releaseModel();model=result;disposeModel=dispose;model.Parent=world;signature=key
    local _,size=model:GetBoundingBox();radius=math.max(size.Magnitude*.5,.2)
    diagnostics.builds=diagnostics.builds+1;diagnostics.model=skin;diagnostics.weapon=weapon;diagnostics.wrap=wrap;diagnostics.parts=0
    for _,part in ipairs(model:GetDescendants())do if part:IsA('BasePart')then diagnostics.parts=diagnostics.parts+1 end end
-   status.Visible=false;yaw,pitch,zoom=-.45,.12,1
+   diagnostics.phase='ready';diagnostics.lastError=nil;failures=0;status.Visible=false;yaw,pitch,zoom=-.45,.12,1
   end)
  end
  connect(viewport.InputBegan,function(input)
@@ -1399,7 +1452,7 @@ return function(page,adapter,Store,connect,cleanups,getValue,isMenuOpen)
    camera.CFrame=CFrame.lookAt(direction*distance,Vector3.zero)
   end
  end)
- table.insert(cleanups,function()stopped=true;generation=generation+1;if model then model:Destroy()end;card:Destroy()end)
+ table.insert(cleanups,function()stopped=true;generation=generation+1;releaseModel();card:Destroy()end)
  return {status=function()return table.clone(diagnostics)end}
 end
 
@@ -6683,7 +6736,7 @@ local function main()
 	local skinModelOptions
 	if gameAdapter then
 		local equipped = gameAdapter.nativeItem()
-		local first = equipped and equipped.Name or gameAdapter.weaponChoices[1]
+		local first = equipped and equipped.Name or table.find(gameAdapter.weaponChoices, "Assault Rifle") and "Assault Rifle" or gameAdapter.weaponChoices[1]
 		Store.contexts.skins = first
 		skinModelOptions = table.clone(gameAdapter.modelChoices[first])
 		pages.skins = columnsPage("skins", "Skin Changer", {{title="Local",rows={
@@ -6838,7 +6891,7 @@ local function main()
 	local searching = false
 
 	local headerIconButtons = {}
-	local headerIcons = { { "comments", 19, 100 }, { "gear", 16, 63 }, { "search", 16, 29 } }
+	local headerIcons = { { "discord", 20, 137 }, { "comments", 19, 100 }, { "gear", 16, 63 }, { "search", 16, 29 } }
 	for _, info in ipairs(headerIcons) do
 		local btn = hitbox({
 			Name = info[1],
@@ -6847,16 +6900,50 @@ local function main()
 			Size = UDim2.fromOffset(24, 24),
 			Parent = header,
 		})
-		local img = icon(info[1], info[2], Theme.HeaderIcon, {
+		local isDiscord = info[1] == "discord"
+		local img = icon(info[1], info[2], isDiscord and Color3.new(1, 1, 1) or Theme.HeaderIcon, {
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.fromScale(0.5, 0.5),
 			Parent = btn,
 		})
+		local hint
+		if isDiscord then
+			btn:SetAttribute("Invite", "https://discord.gg/neverlose-rivals")
+			btn.BackgroundColor3 = Theme.NavActive
+			corner(4).Parent = btn
+			hint = text({Name="DiscordHint",Text="Open Discord invite",TextSize=11,TextColor3=Theme.Label,TextXAlignment=Enum.TextXAlignment.Right,AnchorPoint=Vector2.new(1,0),Position=UDim2.fromOffset(CONTENT_W-125,53),Size=UDim2.fromOffset(160,14),Visible=false,Parent=header})
+			connect(btn.MouseButton1Click, function()
+				local invite = "https://discord.gg/neverlose-rivals"
+				local opened = false
+				local open = openurl or open_url
+				if type(open) == "function" then
+					local ok, result = pcall(open, invite)
+					opened = ok and result ~= false
+				end
+				if not opened then
+					local ok, result = pcall(function() return game:GetService("GuiService"):OpenBrowserWindow(invite) end)
+					opened = ok and result ~= false
+				end
+				if opened then return end
+				local copy = setclipboard or toclipboard
+				if type(copy) == "function" and pcall(copy, invite) then
+					notify("Discord", "Browser opening is blocked. Invite copied: discord.gg/neverlose-rivals")
+				else
+					local box
+					openPanel(btn, "Discord invite", 310, function(rows)
+						local _, input = Controls.input(rows, {Position=UDim2.fromOffset(10,4),Size=UDim2.fromOffset(290,25),text=invite,textSize=12})
+						box = input
+						return ROW_H
+					end)
+					task.defer(function()if box and box.Parent then box:CaptureFocus();box.SelectionStart=1;box.CursorPosition=#invite+1 end end)
+				end
+			end)
+		end
 		connect(btn.MouseEnter, function()
-			tween(img, 0.15, { ImageColor3 = Theme.NavIcon })
+			if hint then hint.Visible=true;tween(btn,0.15,{BackgroundTransparency=0.3})else tween(img, 0.15, { ImageColor3 = Theme.NavIcon })end
 		end)
 		connect(btn.MouseLeave, function()
-			tween(img, 0.15, { ImageColor3 = Theme.HeaderIcon })
+			if hint then hint.Visible=false;tween(btn,0.15,{BackgroundTransparency=1})else tween(img, 0.15, { ImageColor3 = Theme.HeaderIcon })end
 		end)
 		headerIconButtons[info[1]] = btn
 	end
@@ -8983,6 +9070,7 @@ print("Watermark is", menu.get("Main/Interface/Watermark") and "on" or "off")
 end
 
 ICON_DATA = {
+	["discord_20"] = "iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAYAAACM/rhtAAAIPElEQVR4nO1Ya4xkVRH+6pxzb3fPo9ldsxsGjRgeLg4mahYFJWQmGjSYGIx6dxZ5CLLMiogbQ0yIId5t/qohkURkwFcEYaZJjNEgmBB2ogEUCf5aMwqRGGBcWNidfkx333tPff64PTM93TMwK/DDZL+kk053narvVNWpqnOAUziF/0OQlCiiBShbkD4J2f+dksQxzURM91a0rOiIY5qtrnmTXVEmJmDn5yXr/fXK6cYYYc6t4fhf62NnJAAwCWivzOIi7MLCYe46a8/2Qql4Vr3ZXPjNL7afWFNNifbCVKvi3wLBHHFM89wr6R7v0y+IyKeo/tzS0Mi2Vqtx8MGZ0R++0dp9+5fuLw6Vv9xuNf4jxjwjsI9Zg0d+eVfx71uxvTFBUuJDkBdeOFHOSqVrlfyKQD7sggLUe2RZC8YE6n3nKERmRcwu0p++olJIUuQlCE5A+XURY42xYl0JIkCWLntA5j39zHljI1UAqFSEALglgtEcbXWv+Kn9S78eHi1/vtNK4H2bIDwBIwIBIWIcgnAIIMA+1dLNsqRTX7FLAAqCEHHODSEoWCzXl+LZn2y7PYpoNwr3AMEVwanpE58O3OijWdpMANjuZ8DVIHxXy3pd7HpDZKODRYBexELEgEjHH7i7/FwcQyoVWZfLfaeJMj4OXnXL4rCo/RE1I0m3Mbncek5AHCB23UfEbUKuuxlx1EysKzr1/AEgPHJk0GHrCE7EsJWKaFob2l8ojZzts5YXkS2XhJOGGJsmDR+Go5+bOlCfrFbF5zVzY4Iyfwg+ihmScnOWJiTeQXKryPOTXmMwj+CGBCdiWojQvljbWyyMnu2zlr6j3luF2CRpMnClyX0HlvZUKqK9XlwlMNkttCr8htITsnmJJKkA/eDZ3VgaoM/XbEIRVOsCUs3VAICo9z/khbhSEb3qQONDnvIs6Vf/6yNGEcC5YYEYZGkDJDf1NKlqjDPWDYGaIctaKgIzqJo0JhTvk9eHt5ff99PvST3v3ZL3xMNdT2aeXwzCIUGXYZ8xWhuKsQVJs+bf0qTxJCDqXNGQOuBJUhmEo4aqy2lS/5P37X8E4agBhIP1WMT7jgbh8I7l15cuBoAoyjkZoLeP8kIqAemvaaS1BQLyqmp22ew9p31k9t7yJyz8RaR/3rmS9IaQVA3CEfG+/RhtcP7svaddUpbRD2rWutHaUAAzEG6BqDGWNHI5ALwynnMwAKVSEb3qa/VdBC/OsvYq8VWDAI0NDLV144MzI49Ec7QTE3T337Pt6UybV5DMVqJMQq0tiM/aL9tm7fLZu0svRBHtzBj8r2aGf5xl7TvCcMSA6tfboFFVAeUCAJivwAOAWXGlV/t+54aGVROi54SQUOsKJu00FrMztv02imire6Hz85JNxI+7uXt2Pu2zzrMuGDIAvYDqgqJ49b+7776x5vTdDKpV8dERSBTRGmNm0nRZIcagJ9YiIt53AMHu626u7eymgpgVV6qm51jnIOjvh1xpCMerFUnyfpnzn8SkAhQROS59TcmKvBTHNAsv5yTm5qDVKrRgXdP71IuYvpMioj7VwJVG222MA3keut2Lz8h8LvGB/rzIl0HUtynWnXnl9Ctj54ztPHoYMLuOgEeOAFFUFeIz56km3VQCSMKrXlSpiEbdAXXvIThAknZy4vxCYTRI04bP22KPLUCNdSZJeSaQ56FbGNuTu5ly+kYEARFq5sPiacOdRG+tVOQgeobTqRuWDobByHt7DaZJU50rXDq1//VLZivyx65oEsexWXjZ3UYMnvpeGEhh5ftqMxeDTQspxNikXdcgKH1z33S9rMjuJJg6BNeI2FvStKXoPVhUIdUaW/z9vuml2+jlUWOwa2HRxC4oXZwmDRWRTQYQgCLvBoDdi8+ImwR0HgDI91AxWGJWScJk6TKDQvnaLF2+FiBcMIw0qaNbVHtkRagZxbjhICjfkbJGY4sixqFLbssttGcckvSNRUkAPunUKAIHiKRJrRvWDfYkImTGNKkpYGyWtRWAFxHpbmjTXio9TnKH89AogGNi4EEopH/+I4wJJQiLznsiS+vMa19+JLoEB/rX2tY0ExEXhKPGGCDpLIPMBpcQJKEAXgOAhbE9a9c/gi8GAWy+aq3VkVTrSlBN/9JZrh30vvOUMYEUimUXBGUrJpDuGpLU7iBBQCTfVNkWimUnYrM0aTzcai/dROi/jQ1XotI1pF6MOOdghHxp1ZsABTEkehVDNl3+rnXBt0Uc0qSuIiAAI2IgYo8D8nOlzhlIgSKXCvlRgheQfoexoRgTAADUJ1BNFcAxY9yfKXiKyj8AmRUENwgwRfphdgcoEhIWysb7TlM1/U4ZI3eNjcFXKqIDeTC1v3aJMe526wqTgCBN6ppPG4ENC0PI0hSSNc+6797t/wKA67/FHe1WZ2eadbYbFw7lDLVGtTU1y0erMzuWAGDqhqXLSqXyw94DadIA6b2ImCAoC6nwPnlI0bl1dmbb8+vysScBJIrWLtJXHGh8VuBuMcZ90hiLTqemYThi0qQx65fKV9ZP/6e7cMe5af8lpx8TE4+73bsnpVl4rZS1wyecK+5W33FBOIIsbYPgY6R+/8GZkUeAtUvbBgRzxDFN5RAIEQLAvgOtSy3kagi/pKqNYsGf/7M7R48hhqAimj+LQNZfeKoYH49YqYCAcMXoFV9d+rgplJ6gZkcF5iGluf+BmfDJFbsA8GYbXkUU0YJrDz7XTLfOjq47Nr7i7S0pWYd8TXT9sY9dfRPf1euQ/ovSSSGKaNcreAuvVD0bjiLak3lEelPEMc3boTCK5t7pp7hTOIW3Ff8FzUhS6El49rUAAAAASUVORK5CYII=",
 	["models_14"] = "iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAABGklEQVR4nIXRMWtVQRAF4LN5L2DSBNRWU9uq2NsqdsFgSG9lESGQnxCsQjory/wBeWBlY+WPsBFiISSNGgnmfRbOfblcvMnCsjNn5uycmUmuOWgDfzKahD18xpMB/uB/pEm9z3GCHZzhTuGH5W8lydKAPE1ylkSS9SQ/kszrU7072tcLzHBvgD/s7E57K/tlkmdJbpaa8yTfkrxrrc0qd6m1Nu/kBa8xxy728RPbOPDv3MdkMVU0rOE39gp7jC89iR/xqXIv14ENHGMVy9jEd6xgikc16bud3I64jNu9fX0oeVu9+K0FYWSiT2tfR/hapDaW3KrxGzjF28L/YL+r2ucsSrfWLpKsJnmf5E3Br5L8KvtiVOZQxVXxv/qBJnaLgsQ4AAAAAElFTkSuQmCC",
 	["antiaim_14"] = "iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAABLklEQVR4nG2SPS+EQRSFn313164QoSM6GoktRLXNVhq9RKPT+A06/0Ch0mkQrWgQnVon4qMREqESUfjcR+EOk5ebTCZz7jkzc8+9FZWIClAAxv6R4VXgM3LfYAgLoMvfqOTknFeLZBItx80jwBwwANwAW8Aa8PwjVlFb6qG/0VV31XX1OLBzdTz4Beqs+hLJd/VAHQ5CWm31UT1VG0nYr3bUzRCvBLmp1tR6nDuRX1ShdPOkOqNW1CLDq7FfxY8owpw+YAdoAkclw3JHL4HR5Grq2zxwD5wE/lYSdoGxcJn8G/vqndoT53qpxnbUuJRqrEZN05HYU4dKtU+pD+qF2ptcJTNiIcQv6ra6mvX3Wp3I+1h2rqVuqLfqk3oWLRrMH0mzmiINc4oG8PrfrH4B9LyYFapPpUQAAAAASUVORK5CYII=",
 	["antiaim_16"] = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABYElEQVR4nIWTTStEYRTHf/fOJCUplA3JgliIlZ3MWlkIG7YWsvWysvMR+A62lqyYlc+gKSURJRYUizE/izm3njvIqdN97vn/zznPc14ylUQyIAdaQIWyGPayQxKgcPxPSrxq8m3GeQ2oA3NADRgA7oCL0FYpiFrohHpmW279XerqZPBzFdR+dV99DVJT/VQP1Gl1WJ1TjwJ/UsfVTM1R59VGkqWpLiQ3S3U5OFdxgzwFV9TLIEyp1dBcrahdwTsOznzxhKwjS00diXOKVSLYrNpSD1Wq0XuAHWAI2OvofeccPIbPSNHTLMB1YBfoSeylmQl7X/Cf6SCeBrAQmboCK7Qa9tX4rxdzkMcbR6N91+rgH12YUd/VG7VbzdICoW5FhRvqktobCQbVTfUtCli0uZJGL4JsxyyofqgPyYw8qosmk5guU7ooY8BG1KMfuAfOgRPghfamfgE/ApCCf0gJ/wbNKNuZoTPGDAAAAABJRU5ErkJggg==",
