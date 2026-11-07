@@ -1323,6 +1323,11 @@ return function(connect,cleanups,getValue,isMenuOpen)
  end
  function A.nativeItem()return item()end
  function A.nativeFighter()return localFighter()end
+ function A.scriptController(name)
+  local available={FighterController=fc,CameraController=camera,MechanicsController=mechanics}
+  assert(available[name],'controller is not exposed: '..tostring(name));return available[name]
+ end
+ function A.scriptCameraSet(pitch,yaw)return atGameIdentity(function()return camera:SetRotation(Vector2.new(pitch,yaw))end)end
  local function mapVoteSnapshot()
   local duel=duels and duels:GetDuel(player)
   local dueler=duel and not duel._destroyed and duel:GetDueler(player)
@@ -4643,6 +4648,993 @@ end
 
 end)()
 
+local installScriptRuntime = (function()
+-- Managed client Lua extensions. This is a lifecycle boundary, not a security sandbox.
+return function(menu,opts)
+ opts=opts or {}
+ local root=opts.root or 'neverlose_ui'
+ local fs=opts.fs or {read=readfile,write=writefile,list=listfiles,exists=isfile,remove=delfile,mkdir=makefolder,isdir=isfolder}
+ local scheduler=opts.task or task
+ local encode=opts.encode or function(v)return game:GetService('HttpService'):JSONEncode(v)end
+ local decode=opts.decode or function(v)return game:GetService('HttpService'):JSONDecode(v)end
+ local base=opts.environment or (getfenv and getfenv())or _G
+ local compile=opts.compile or function(source,name,environment)
+  local fn,err=loadstring(source,name)
+  if fn then assert(type(setfenv)=='function','This executor does not support script environments');setfenv(fn,environment)end
+  return fn,err
+ end
+ local function clone(v,seen)
+  if type(v)~='table'then return v end
+  seen=seen or {};assert(not seen[v],'cyclic tables are not supported');seen[v]=true
+  local out={};for k,x in pairs(v)do out[k]=clone(x,seen)end;seen[v]=nil;return out
+ end
+ local function folder(path)if not fs.isdir(path)then fs.mkdir(path)end end
+ folder(root);folder(root..'/scripts');folder(root..'/script_data');folder(root..'/script_docs')
+ local metaPath=root..'/scripts_meta.json'
+ local function readJson(path)
+  if not fs.exists(path)then return nil end
+  local ok,value=pcall(function()return decode(fs.read(path))end)
+  return ok and type(value)=='table'and value or nil
+ end
+ local old=readJson(metaPath)or {}
+ local meta=old.version==2 and old.files or {};if type(meta)~='table'then meta={}end
+ local legacy=old.version~=2 and old or {}
+ local states,records,logs={}, {}, {}
+ local stopped=false;local pendingNotify=false
+ local manager={version=1}
+ local function changed()
+  if pendingNotify or stopped then return end;pendingNotify=true
+  scheduler.defer(function()pendingNotify=false;if not stopped and opts.changed then opts.changed()end end)
+ end
+ local function persistMeta()fs.write(metaPath,encode({version=2,files=meta}))end
+ local function filename(name)
+  assert(type(name)=='string','script name must be a string')
+  name=name:match('^%s*(.-)%s*$')
+  assert(#name>0 and #name<=100 and not name:find('[%c/\\:*?"<>|]')and not name:find('..',1,true),'invalid script filename')
+  assert(name:sub(-1)~='.'and name:sub(-1)~=' ','invalid script filename')
+  local extension=name:match('%.([^.]*)$')
+  if not extension then name=name..'.lua';extension='lua'end
+  assert(extension=='lua'or extension=='luau','use a .lua or .luau file')
+  return name
+ end
+ local function path(name)return root..'/scripts/'..filename(name)end
+ local function dataPath(name)return root..'/script_data/'..name..'.json'end
+ local function log(name,level,message)
+  local entries=logs[name]or {};logs[name]=entries
+  entries[#entries+1]={time=os.time(),level=level,message=tostring(message):sub(1,8000)}
+  if #entries>100 then table.remove(entries,1)end
+ end
+ local function saveData(record)fs.write(dataPath(record.name),encode(record.data))end
+ local function announce(title,message,kind)if opts.notify then opts.notify(title,message,kind)elseif menu.notify then menu.notify(title,message)end end
+ local unload
+ local function fault(record,where,err)
+  if not record.active then return end
+  local message=where..': '..tostring(err)
+  record.error=message;log(record.name,'error',message)
+  unload(record.name,'error')
+  announce('Lua error',record.name..': '..message,'error')
+ end
+ local function disconnect(handle)
+  if type(handle)=='function'then return handle()end
+  -- Instances and Drawing userdata can throw when an unknown member is read.
+  for _,name in ipairs({'Disconnect','Destroy','Remove'})do
+   local ok,method=pcall(function()return handle[name]end)
+   if ok and type(method)=='function'then return method(handle)end
+  end
+  error('resource has no supported cleanup method',0)
+ end
+ local function newRecord(name)
+  local data=readJson(dataPath(name))or {}
+  data.controls=type(data.controls)=='table'and data.controls or {};data.storage=type(data.storage)=='table'and data.storage or {}
+  local r={name=name,active=true,phase='loading',resources={},threads={},events={},groups={},items={},data=data}
+  function r.track(resource)
+   assert(resource~=nil,'cleanup resource is missing')
+   if r.active then r.resources[#r.resources+1]=resource else pcall(disconnect,resource)end
+   return resource
+  end
+  function r.call(where,fn,...)
+   if not r.active then return false end
+   local results=table.pack(pcall(fn,...))
+   if not results[1]then fault(r,where,results[2])end
+   return table.unpack(results,1,results.n)
+  end
+  function r.defer(fn,...)
+   assert(type(fn)=='function','callback must be a function');if not r.active then return end
+   local args=table.pack(...);local thread
+   thread=scheduler.defer(function()
+    if r.active then r.call('task',fn,table.unpack(args,1,args.n))end
+    if thread then r.threads[thread]=nil end
+   end)
+   if r.active then r.threads[thread]=true end
+   return thread
+  end
+  function r.subscribe(event,fn)
+   assert(type(fn)=='function','callback must be a function');assert(r.active,'script is unloaded')
+   local list=r.events[event]or {};r.events[event]=list
+   local sub={active=true,fn=fn}
+   function sub:Disconnect()self.active=false;self.fn=nil end
+   list[#list+1]=sub;r.track(sub);return sub
+  end
+  return r
+ end
+ local supportedEvents={render=true,heartbeat=true,input_began=true,input_ended=true,menu_changed=true,setting_changed=true,
+  local_character_changed=true,weapon_changed=true,shot_requested=true,shot_fired=true,bullet_tracer=true,hit_confirmed=true,unload=true}
+ local hookSlots=setmetatable({},{__mode='k'})
+ local function addHook(r,object,key,callback)
+  assert(type(object)=='table'and type(object[key])=='function','hooks.wrap expects a table method')
+  assert(type(callback)=='function','hook callback must be a function')
+  local slots=hookSlots[object]or {};hookSlots[object]=slots
+  local slot=slots[key]
+  if not slot then
+   slot={original=object[key],raw=rawget(object,key),layers={}};slots[key]=slot
+   slot.dispatch=function(...)
+    local chain={};for _,layer in ipairs(slot.layers)do if layer.active and layer.record.active then chain[#chain+1]=layer end end
+    local function run(index,...)
+     local layer=chain[index]
+     if not layer or not layer.active or not layer.record.active then
+      if not layer then return slot.original(...)end
+      return run(index+1,...)
+     end
+     local called=false;local result
+     local function nextCall(...)
+      assert(not called,'a method hook may call next only once');called=true
+      result=table.pack(run(index+1,...));return table.unpack(result,1,result.n)
+     end
+     local output=table.pack(pcall(layer.callback,nextCall,...))
+     if output[1]then return table.unpack(output,2,output.n)end
+     fault(layer.record,'hook '..tostring(key),output[2])
+     if called then if result then return table.unpack(result,1,result.n)end;error(output[2],0)end
+     return run(index+1,...)
+    end
+    return run(1,...)
+   end
+   object[key]=slot.dispatch
+  else assert(object[key]==slot.dispatch,'method was replaced outside the Lua hook manager')end
+  local layer={active=true,record=r,callback=callback};slot.layers[#slot.layers+1]=layer
+  local handle={}
+  function handle:Disconnect()
+   if not layer.active then return end;layer.active=false
+   local remaining={};for _,x in ipairs(slot.layers)do if x.active then remaining[#remaining+1]=x end end;slot.layers=remaining
+   if #remaining==0 then if object[key]==slot.dispatch then object[key]=slot.raw end;slots[key]=nil end
+  end
+  return r.track(handle)
+ end
+ local function makeContext(r)
+  local ctx={version=1}
+  local scriptInfo={name=r.name:gsub('%.luau?$',''),filename=r.name,api_version=1}
+  function scriptInfo.is_loaded()return r.active end
+  function scriptInfo.cleanup(resource)return r.track(resource)end
+  function scriptInfo.on_unload(fn)return r.subscribe('unload',fn)end
+  function scriptInfo.unload()return unload(r.name)end
+  ctx.script=scriptInfo
+  ctx.events=setmetatable({},{__index=function(self,event)
+   assert(supportedEvents[event],'unsupported event: '..tostring(event))
+   local handle={}
+   function handle:set(fn)return r.subscribe(event,fn)end
+   function handle:unset(fn)for _,sub in ipairs(r.events[event]or {})do if sub.fn==fn then sub.active=false end end end
+   setmetatable(handle,{__call=function(_,fn)return r.subscribe(event,fn)end});rawset(self,event,handle);return handle
+  end})
+  local function boundConnect(signal,fn)
+   assert(r.active,'script is unloaded')
+   return r.track(signal:Connect(function(...)r.call('signal',fn,...)end))
+  end
+  ctx.utils={connect=boundConnect}
+  ctx.hooks={wrap=function(object,key,fn)assert(r.active,'script is unloaded');return addHook(r,object,key,fn)end}
+  ctx.storage={}
+  function ctx.storage.get(key,default)local value=r.data.storage[key];if value==nil then value=default end;return clone(value)end
+  function ctx.storage.set(key,value)
+   assert(r.active,'script is unloaded');assert(type(key)=='string','storage key must be a string')
+   local nextData=clone(r.data);nextData.storage[key]=clone(value);encode(nextData)
+   fs.write(dataPath(r.name),encode(nextData));r.data=nextData
+  end
+  function ctx.storage.delete(key)return ctx.storage.set(key,nil)end
+  local function addItem(group,kind,label,default,extra)
+   assert(r.active,'script is unloaded');assert(type(label)=='string'and #label>0,'control needs a label')
+   local id=group.name..'/'..label;assert(not r.items[id],'duplicate control: '..id)
+   local item={id=id,label=label,kind=kind,group=group.name,visible=true,callbacks={},options=extra and extra.options,
+    min=extra and extra.min,max=extra and extra.max,step=extra and extra.step or 1}
+   local function validate(value)
+    if kind=='switch'then assert(type(value)=='boolean','switch expects boolean')
+    elseif kind=='slider'then assert(type(value)=='number'and value==value and math.abs(value)<math.huge,'slider expects finite number');value=math.clamp(value,item.min,item.max);value=math.clamp(item.min+math.floor((value-item.min)/item.step+.5)*item.step,item.min,item.max)
+    elseif kind=='combo'then assert(table.find(item.options,value),'unknown combo choice')
+    elseif kind=='selectable'then assert(type(value)=='table','selectable expects a table');local out={};for _,v in ipairs(value)do assert(table.find(item.options,v),'unknown selectable choice');if not table.find(out,v)then out[#out+1]=v end end;value=out
+    elseif kind=='input'or kind=='label'then assert(type(value)=='string','control expects a string')
+    elseif kind=='hotkey'then assert(type(value)=='string'and value:match('^[%w_]+$'),'hotkey expects a key name')
+    elseif kind=='color'then assert(type(value)=='string'and value:match('^#%x%x%x%x%x%x$'),'color expects #RRGGBB')end
+    return clone(value)
+   end
+   item.default=clone(default);local value=r.data.controls[id]
+   local ok,valid=pcall(validate,value);item.value=ok and valid or validate(default)
+   function item:get()return clone(self.value)end
+   function item:set(nextValue)
+    assert(r.active,'script is unloaded');nextValue=validate(nextValue);local nextData=clone(r.data);nextData.controls[id]=clone(nextValue)
+    if kind~='button'and kind~='label'then fs.write(dataPath(r.name),encode(nextData));r.data=nextData end
+    self.value=nextValue
+    local callbacks={};for _,sub in ipairs(self.callbacks)do callbacks[#callbacks+1]=sub end
+    for _,sub in ipairs(callbacks)do if sub.active then r.call('control '..id,sub.fn,self)end end
+    return self
+   end
+   function item:set_callback(fn,immediate)
+    assert(type(fn)=='function','callback must be a function');local sub={active=true,fn=fn}
+    function sub:Disconnect()self.active=false;self.fn=nil end
+    self.callbacks[#self.callbacks+1]=sub;r.track(sub)
+    if immediate then r.call('control '..id,fn,self)end
+    return sub
+   end
+   function item:visibility(visible)
+    if visible==nil then return self.visible end;self.visible=visible==true
+    for _,sub in ipairs(self.callbacks)do if sub.active then r.call('control visibility',sub.fn,self)end end
+    return self
+   end
+   function item:press()if kind=='button'then for _,sub in ipairs(self.callbacks)do if sub.active then r.call('button '..id,sub.fn,self)end end end end
+   r.items[id]=item;group.items[#group.items+1]=item;changed();return item
+  end
+  ctx.ui={}
+  function ctx.ui.create(name)
+   assert(type(name)=='string'and #name>0,'group needs a name');assert(r.active,'script is unloaded')
+   for _,existing in ipairs(r.groups)do if existing.name==name then return existing end end
+   local group={name=name,items={}};r.groups[#r.groups+1]=group
+   function group:switch(label,default)return addItem(self,'switch',label,default==true)end
+   function group:slider(label,min,max,default,step)
+    assert(type(min)=='number'and type(max)=='number'and min<max and math.abs(min)<math.huge and math.abs(max)<math.huge,'invalid slider range')
+    assert(step==nil or type(step)=='number'and step>0 and step<math.huge,'invalid slider step')
+    return addItem(self,'slider',label,default or min,{min=min,max=max,step=step})
+   end
+   local function choices(values,...)if type(values)~='table'then values={values,...}end;assert(#values>0,'provide at least one choice');local out={};for _,v in ipairs(values)do assert(type(v)=='string'and not table.find(out,v),'choices must be unique strings');out[#out+1]=v end;return out end
+   function group:combo(label,values,...)values=choices(values,...);return addItem(self,'combo',label,values[1],{options=values})end
+   function group:selectable(label,values,...)return addItem(self,'selectable',label,{},{options=choices(values,...)})end
+   function group:input(label,default)return addItem(self,'input',label,default or '')end
+   function group:hotkey(label,default)return addItem(self,'hotkey',label,default or 'None')end
+   function group:color_picker(label,default)return addItem(self,'color',label,default or '#FFFFFF')end
+   function group:label(label)return addItem(self,'label',label,label)end
+   function group:button(label,fn)local item=addItem(self,'button',label,false);item:set_callback(fn);return item end
+   return group
+  end
+  function ctx.ui.find(path,context)
+   assert(menu.get(path,context)~=nil,'unknown menu setting: '..tostring(path))
+   return {get=function()return menu.get(path,context)end,set=function(_,value)assert(r.active or r.unloading,'script is unloaded');menu.set(path,value,context)end,
+    set_callback=function(_,fn,immediate)
+     assert(type(fn)=='function','callback must be a function')
+     local handle=r.track(menu.onChanged(path,function()r.call('menu setting '..path,fn,ctx.ui.find(path,context))end))
+     if immediate then r.call('menu setting '..path,fn,ctx.ui.find(path,context))end;return handle
+    end}
+  end
+  ctx.menu={get=menu.get,set=function(...)assert(r.active or r.unloading,'script is unloaded');return menu.set(...)end,paths=menu.paths,notify=menu.notify,is_open=function()return menu.ui.status().open end,
+   onChanged=function(path,fn)return r.track(menu.onChanged(path,function(...)r.call('menu setting',fn,...)end))end,
+   onAnyChanged=function(fn)return r.track(menu.onAnyChanged(function(...)r.call('menu setting',fn,...)end))end}
+  ctx.task={wait=scheduler.wait,cancel=function(thread)if r.threads[thread]then pcall(scheduler.cancel,thread);r.threads[thread]=nil end end}
+  ctx.task.defer=r.defer;ctx.task.spawn=r.defer
+  function ctx.task.delay(seconds,fn,...)
+   assert(type(seconds)=='number'and seconds>=0 and seconds<math.huge,'invalid delay');assert(type(fn)=='function','callback must be a function')
+   if not r.active then return end
+   local args=table.pack(...);local thread
+   thread=scheduler.delay(seconds,function()if r.active then r.call('timer',fn,table.unpack(args,1,args.n))end;if thread then r.threads[thread]=nil end end)
+   if r.active then r.threads[thread]=true end;return thread
+  end
+  function ctx.print(...)
+   local args=table.pack(...);local out={};for i=1,args.n do out[i]=tostring(args[i])end;log(r.name,'info',table.concat(out,'\t'))
+  end
+  function ctx.warn(...)local args=table.pack(...);local out={};for i=1,args.n do out[i]=tostring(args[i])end;log(r.name,'warning',table.concat(out,'\t'))end
+  if opts.buildContext then opts.buildContext(ctx,r)end
+  r.context=ctx
+  return ctx
+ end
+ unload=function(name,phase)
+  name=filename(name);local r=records[name];if not r or not r.active then return false end
+  r.active=false;r.unloading=true;r.phase=phase or 'unloaded';states[name]={phase=r.phase,error=r.error}
+  local current=coroutine.running()
+  for thread in pairs(r.threads)do if thread~=current then pcall(scheduler.cancel,thread)end end;r.threads={}
+  for _,sub in ipairs(r.events.unload or {})do if sub.active then local ok,err=pcall(sub.fn);if not ok then log(name,'error','unload: '..tostring(err))end end end
+  for i=#r.resources,1,-1 do local ok,err=pcall(disconnect,r.resources[i]);if not ok then log(name,'error','cleanup: '..tostring(err))end end
+  r.unloading=false;r.resources={};r.groups={};r.items={};if records[name]==r then records[name]=nil end
+  log(name,'info',r.phase=='error'and 'Stopped after an error' or 'Unloaded');changed();return true
+ end
+ function manager.list(order)
+  local out={};for _,file in ipairs(fs.list(root..'/scripts'))do
+   local name=file:match('([^/\\]+)$');local ok=name and name:match('%.luau?$')and pcall(filename,name)
+   if ok and fs.exists(file)and not name:find('..',1,true)then
+    local info=meta[name];if type(info)~='table'then info={modified=tonumber(legacy[name:gsub('%.luau?$','')])or 0,autoload=false}end
+    info.modified=tonumber(info.modified)or 0;if info.modified~=info.modified or info.modified<0 or info.modified==math.huge then info.modified=0 end
+    info.autoload=info.autoload==true;meta[name]=info
+    local readable,source=pcall(fs.read,file);local r=records[name];local state=states[name]or {}
+    out[#out+1]={name=name,display=name:gsub('%.luau?$',''),file=file,modified=info.modified or 0,autoload=info.autoload==true,
+     lines=readable and select(2,source:gsub('\n','\n'))+1 or 0,phase=r and r.phase or state.phase or 'unloaded',error=r and r.error or state.error,
+     loaded=r~=nil and r.active,controls=r and #r.groups or 0}
+   end
+  end
+  table.sort(out,function(a,b)if order=='By date'and a.modified~=b.modified then return a.modified>b.modified end;return a.name:lower()<b.name:lower()end);return out
+ end
+ function manager.read(name)return fs.read(path(name))end
+ function manager.check(source,name)
+  local ok,fn,err=pcall(compile,source,'='..filename(name),setmetatable({},{__index=base}))
+  if not ok then return false,tostring(fn)end;return fn~=nil,err
+ end
+ local function collision(name,except)
+  for _,entry in ipairs(manager.list())do if entry.name:lower()==name:lower()and entry.name~=except then return true end end
+  return false
+ end
+ function manager.save(name,source)
+  name=filename(name);assert(type(source)=='string','source must be a string');assert(not collision(name,name),'a script with this filename already exists')
+  fs.write(path(name),source);meta[name]=meta[name]or {};meta[name].modified=os.time();persistMeta();changed();return name
+ end
+ function manager.create(name,source)
+  name=filename(name);assert(not collision(name),'a script with this filename already exists')
+  return manager.save(name,source or opts.template or '-- '..name..'\nprint("Loaded")\n')
+ end
+ function manager.load(name)
+  assert(not stopped,'script manager is unloaded');name=filename(name)
+  if records[name]and records[name].active then return false,'script is already loaded'end
+  local ok,source=pcall(manager.read,name);if not ok then return false,tostring(source)end
+  local r=newRecord(name);records[name]=r
+  local ready,context=pcall(makeContext,r)
+  if not ready then fault(r,'API initialization',context);return false,r.error end
+  local environment=setmetatable({neverlose=context},{__index=base})
+  for key,value in pairs(context)do environment[key]=value end
+  local compiled,fn,err=pcall(compile,source,'='..name,environment)
+  if not compiled or not fn then fault(r,'compile',compiled and err or fn);return false,r.error end
+  log(name,'info','Loading');changed()
+  r.defer(function()
+   local result=table.pack(fn(context))
+   if type(result[1])=='function'then r.track(result[1])end
+   if r.active then r.phase='loaded';states[name]={phase='loaded'};log(name,'info','Loaded');changed()end
+  end)
+  return true
+ end
+ manager.unload=unload
+ function manager.reload(name)unload(name);return manager.load(name)end
+ function manager.autoload(name,enabled)
+  name=filename(name);assert(fs.exists(path(name)),'script not found');meta[name]=meta[name]or {};meta[name].autoload=enabled==true;persistMeta();changed()
+ end
+ function manager.rename(name,newName)
+  name=filename(name);newName=filename(newName);if name==newName then return newName end
+  assert(not collision(newName),'a script with this filename already exists');local source=manager.read(name)
+  local wasLoaded=records[name]and records[name].active;unload(name)
+  fs.write(path(newName),source)
+  if fs.exists(dataPath(name))then fs.write(dataPath(newName),fs.read(dataPath(name)))end
+  fs.remove(path(name));if fs.exists(dataPath(name))then fs.remove(dataPath(name))end
+  meta[newName]=meta[name]or {};meta[newName].modified=os.time();meta[name]=nil;states[name]=nil;logs[newName]=logs[name];logs[name]=nil;persistMeta();changed()
+  if wasLoaded then manager.load(newName)end;return newName
+ end
+ function manager.duplicate(name)
+  name=filename(name);local stem,ext=name:match('^(.*)(%.luau?)$');local candidate=stem..' copy'..ext;local i=2
+  while collision(candidate)do candidate=stem..' copy '..i..ext;i=i+1 end
+  return manager.create(candidate,manager.read(name))
+ end
+ function manager.delete(name)
+  name=filename(name);unload(name);fs.remove(path(name));if fs.exists(dataPath(name))then fs.remove(dataPath(name))end
+  meta[name]=nil;states[name]=nil;logs[name]=nil;persistMeta();changed()
+ end
+ function manager.logs(name)return clone(logs[filename(name)]or {})end
+ function manager.controls(name)local r=records[filename(name)];return r and r.groups or {}end
+ function manager.emit(event,...)
+  local list={};for _,r in pairs(records)do if r.active then list[#list+1]=r end end
+  table.sort(list,function(a,b)return a.name<b.name end)
+  for _,r in ipairs(list)do
+   if event=='render'and r.beforeRender then r.beforeRender()end
+   local callbacks={};for _,sub in ipairs(r.events[event]or {})do callbacks[#callbacks+1]=sub end
+   for _,sub in ipairs(callbacks)do if sub.active and r.active then r.call('event '..event,sub.fn,...)end end
+   if event=='render'and r.active and r.afterRender then r.afterRender()end
+  end
+ end
+ function manager.startAutoload()for _,entry in ipairs(manager.list())do if entry.autoload then manager.load(entry.name)end end end
+ function manager.status()
+  local count=0;for _,r in pairs(records)do if r.active then count=count+1 end end
+  return {version=1,loaded=count,stopped=stopped,directory=root..'/scripts',capabilities=opts.capabilities and clone(opts.capabilities)or {}}
+ end
+ function manager.destroy()
+  if stopped then return end;stopped=true;local names={};for name in pairs(records)do names[#names+1]=name end
+  for _,name in ipairs(names)do unload(name)end
+ end
+ -- Documentation and bundled examples are installed locally; existing script source is preserved.
+ if opts.docs then fs.write(root..'/script_docs/README.md',opts.docs)end
+ for name,source in pairs(opts.examples or {})do if not collision(filename(name))then manager.create(name,source)end end
+ manager.list();persistMeta()
+ return manager
+end
+
+end)()
+
+local installScriptBridge = (function()
+-- RIVALS/Roblox implementations for the managed scripting API.
+return function(menu,connect,cleanups)
+ local Players=game:GetService('Players');local Run=game:GetService('RunService');local UIS=game:GetService('UserInputService')
+ local player=Players.LocalPlayer;local adapter=menu.adapter
+ local function resolve(path)return adapter and adapter.resolve(path)end
+ local participants=resolve('Shared/Participant');local hostility=resolve('Shared/Combat/Hostility')
+ local pov=resolve('Client/CameraPOV');local gun=resolve('Client/Controllers/GunController');local bullets=resolve('Client/Controllers/BulletController')
+ local function native(fn,...)
+  local prior=getthreadidentity and getthreadidentity();if setthreadidentity then setthreadidentity(2)end
+  local result=table.pack(pcall(fn,...));if setthreadidentity and prior then setthreadidentity(prior)end
+  if not result[1]then error(result[2],0)end;return table.unpack(result,2,result.n)
+ end
+ local function weapon()
+  local w=adapter and adapter.nativeItem and adapter.nativeItem();if not w or w._destroyed then return nil end
+  return native(function()return {name=w.Name,ammo=w:Get('Ammo'),max_ammo=w.Info.MaxAmmo,aiming=w:Get('IsAiming')==true,
+   reloading=tick()<(w._reload_cooldown or 0),type=w.Info.Type,class=w.Info.Class,is_raycast=w.Info.IsRaycast==true,
+   shoot_damage=w.Info.ShootDamage,critical_damage=w.Info.CriticalDamage,shoot_cooldown=w.Info.ShootCooldown}end)
+ end
+ local function ownerModel(owner)return participants and participants.BodyOf(owner)or owner==player and player.Character or nil end
+ local function wrap(owner)
+  if not owner then return nil end
+  local e={}
+  function e:get_player()return typeof(owner)=='Instance'and owner:IsA('Player')and owner or nil end
+  function e:get_name()return participants and participants.NameOf(owner)or owner.Name end
+  function e:get_model()return ownerModel(owner)end
+  function e:get_origin()local m=self:get_model();local r=m and(m:FindFirstChild('HumanoidRootPart')or m.PrimaryPart);return r and r.Position end
+  function e:get_velocity()local m=self:get_model();local r=m and(m:FindFirstChild('HumanoidRootPart')or m.PrimaryPart);return r and r.AssemblyLinearVelocity end
+  function e:get_health()local hp=adapter and adapter.health(owner);return hp or 0 end
+  function e:get_max_health()local _,hp;if adapter then _,hp=adapter.health(owner)end;return hp or 0 end
+  function e:is_alive()return self:get_model()~=nil and self:get_health()>0 end
+  function e:is_enemy()return hostility and hostility.IsHostile(player,owner)==true or false end
+  function e:get_team()return adapter and adapter.datum(owner,{'Team'})end
+  function e:get_hitboxes()return adapter and adapter.zones(owner)or {}end
+  function e:get_hitbox_position(name)local part=self:get_hitboxes()[name or 'Head'];return part and part.Parent and part.Position or nil end
+  function e:get_weapon()
+   if owner==player then return weapon()end
+   local name=adapter and adapter.datum(owner,{'CurrentWeapon'});if not name then return nil end
+   return {name=name,ammo=adapter.datum(owner,{'Ammo'}),max_ammo=adapter.datum(owner,{'MaxAmmo'}),aiming=adapter.datum(owner,{'Aiming'})==true}
+  end
+  return e
+ end
+ local function all(options)
+  options=options or {};local result={}
+  for _,owner in ipairs(participants and participants.All()or Players:GetPlayers())do
+   local e=wrap(owner)
+   if (options.include_local or owner~=player)and(not options.enemies_only or e:is_enemy())and(not options.alive_only or e:is_alive())then result[#result+1]=e end
+  end
+  return result
+ end
+ local capabilities={entities=adapter~=nil,weapon_data=adapter~=nil,camera_rotation=adapter and type(adapter.scriptCameraSet)=='function'or false,
+  native_controllers=adapter and type(adapter.scriptController)=='function'or false,method_hooks=true,
+  drawing=type(Drawing)=='table'and type(Drawing.new)=='function',shot_events=gun~=nil,hit_events=bullets~=nil}
+ local frameTime=0
+ local bridge={capabilities=capabilities}
+ function bridge.buildContext(ctx,record)
+  ctx.vector=Vector3.new;ctx.vector2=Vector2.new;ctx.color=Color3.fromRGB
+  ctx.entity={get_local_player=function()return ownerModel(player)and wrap(player)or nil end,get_entities=all,
+   get_players=function(enemiesOnly,includeDead)return all({enemies_only=enemiesOnly==true,alive_only=includeDead~=true})end,
+   from_player=function(p)assert(typeof(p)=='Instance'and p:IsA('Player'),'expected a Player');return wrap(p)end}
+  ctx.rivals={capabilities=function()return table.clone(capabilities)end,get_weapon=weapon,
+   get_native_fighter=function()return adapter and adapter.nativeFighter and adapter.nativeFighter()end,
+   get_native_weapon=function()return adapter and adapter.nativeItem and adapter.nativeItem()end,
+   get_controller=function(name)assert(capabilities.native_controllers,'native controllers are unavailable');return adapter.scriptController(name)end,
+   is_input_blocked=function()if not adapter then return true end;local ok,reason=pcall(native,adapter.blocked);return not ok or reason~=nil end}
+  ctx.camera={}
+  function ctx.camera.get_eye()local c=workspace.CurrentCamera;return pov and native(pov.GetEyeCFrame)or c and c.CFrame end
+  function ctx.camera.get_rotation()local cf=ctx.camera.get_eye();if not cf then return nil end;local d=cf.LookVector;return Vector2.new(math.asin(math.clamp(d.Y,-1,1)),math.atan2(-d.X,-d.Z))end
+  function ctx.camera.set_rotation(pitch,yaw)
+   assert(record.active,'script is unloaded');assert(capabilities.camera_rotation,'native camera rotation is unavailable')
+   assert(type(pitch)=='number'and type(yaw)=='number'and pitch==pitch and yaw==yaw and math.abs(pitch)<math.huge and math.abs(yaw)<math.huge,'angles must be finite radians')
+   return adapter.scriptCameraSet(math.clamp(pitch,-math.rad(89.9),math.rad(89.9)),(yaw+math.pi)%(2*math.pi)-math.pi)
+  end
+  function ctx.camera.get_fov()local c=workspace.CurrentCamera;return c and c.FieldOfView end
+  ctx.input={get_mouse_position=function()return UIS:GetMouseLocation()end,is_typing=function()return UIS:GetFocusedTextBox()~=nil end}
+  function ctx.input.is_key_down(key)
+   if key=='None'then return false
+   elseif key=='Mouse1'then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+   elseif key=='Mouse2'then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+   elseif key=='Mouse3'then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton3)end
+   if type(key)=='string'then key=Enum.KeyCode[key]end
+   assert(typeof(key)=='EnumItem'and key.EnumType==Enum.KeyCode,'unknown key');return UIS:IsKeyDown(key)
+  end
+  function ctx.utils.trace_line(from,to,params)assert(typeof(from)=='Vector3'and typeof(to)=='Vector3','trace needs two Vector3 positions');return workspace:Raycast(from,to-from,params)end
+  function ctx.utils.is_visible(e,hitbox)
+   local point=e:get_hitbox_position(hitbox);local eye=ctx.camera.get_eye();local model=e:get_model();if not(point and eye and model)then return false end
+   local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude;params.IgnoreWater=true
+   local ignored={};local own=ownerModel(player);if own then ignored[#ignored+1]=own end;if workspace.CurrentCamera then ignored[#ignored+1]=workspace.CurrentCamera end
+   params.FilterDescendantsInstances=ignored
+   local hit=workspace:Raycast(eye.Position,point-eye.Position,params);return not hit or hit.Instance:IsDescendantOf(model)
+  end
+  ctx.globals={realtime=os.clock,curtime=function()return workspace:GetServerTimeNow()end,frametime=function()return frameTime end}
+  ctx.ui.is_open=ctx.menu.is_open
+  ctx.render={}
+  function ctx.render.screen_size()local c=workspace.CurrentCamera;return c and c.ViewportSize or Vector2.zero end
+  function ctx.render.world_to_screen(position)
+   local c=workspace.CurrentCamera;if not c then return nil,false end
+   local p,onScreen=c:WorldToViewportPoint(position);return Vector2.new(p.X,p.Y),onScreen and p.Z>0
+  end
+  local pool={};local cursors={};local inRender=false
+  local function drawing(kind)
+   assert(capabilities.drawing,'Drawing is unavailable in this executor');assert(record.active,'script is unloaded')
+   local object=Drawing.new(kind);record.track(function()pcall(function()object:Remove()end)end);return object
+  end
+  function ctx.render.new(kind)return drawing(kind)end
+  local function use(kind)
+   assert(inRender,'immediate drawing is only available in events.render')
+   local list=pool[kind]or {};pool[kind]=list;local index=(cursors[kind]or 0)+1;cursors[kind]=index
+   if not list[index]then list[index]=drawing(kind)end
+   local object=list[index];object.Visible=true;object.Transparency=1;return object
+  end
+  record.beforeRender=function()inRender=true;table.clear(cursors)end
+  record.afterRender=function()inRender=false;for kind,list in pairs(pool)do for i=(cursors[kind]or 0)+1,#list do list[i].Visible=false end end end
+  function ctx.render.text(position,color,text,size,center)
+   local d=use('Text');d.Position=position;d.Color=color;d.Text=tostring(text);d.Size=size or 14;d.Center=center==true;d.Outline=true;d.Font=2;return d.TextBounds
+  end
+  function ctx.render.line(from,to,color,thickness)local d=use('Line');d.From=from;d.To=to;d.Color=color;d.Thickness=thickness or 1 end
+  function ctx.render.rect(position,size,color,filled)local d=use('Square');d.Position=position;d.Size=size;d.Color=color;d.Filled=filled~=false;d.Thickness=1 end
+  function ctx.render.circle(position,radius,color,filled,thickness)local d=use('Circle');d.Position=position;d.Radius=radius;d.Color=color;d.Filled=filled==true;d.Thickness=thickness or 1;d.NumSides=48 end
+ end
+ function bridge.start(manager)
+  connect(Run.RenderStepped,function(dt)frameTime=dt;manager.emit('render',dt)end)
+  local previousCharacter,previousWeapon,previousOpen;local nextPoll=0
+  connect(Run.Heartbeat,function(dt)
+   manager.emit('heartbeat',dt)
+   if os.clock()<nextPoll then return end;nextPoll=os.clock()+.1
+   local character=ownerModel(player);local item=adapter and adapter.nativeItem and adapter.nativeItem();local open=menu.ui.status().open
+   if character~=previousCharacter then previousCharacter=character;manager.emit('local_character_changed',character)end
+   if item~=previousWeapon then previousWeapon=item;manager.emit('weapon_changed',weapon())end
+   if open~=previousOpen then previousOpen=open;manager.emit('menu_changed',open)end
+  end)
+  connect(UIS.InputBegan,function(...)manager.emit('input_began',...)end);connect(UIS.InputEnded,function(...)manager.emit('input_ended',...)end)
+  table.insert(cleanups,menu.onAnyChanged(function(...)manager.emit('setting_changed',...)end).Disconnect)
+  if adapter and adapter.onBeforeShot then table.insert(cleanups,adapter.onBeforeShot(function()manager.emit('shot_requested',weapon())end))end
+  if gun and gun.Fired then connect(gun.Fired,function()manager.emit('shot_fired',weapon())end)end
+  if bullets then
+   if bullets.ShotEmitted then connect(bullets.ShotEmitted,function(_,origin,direction)manager.emit('bullet_tracer',origin,direction)end)end
+   if bullets.HitConfirmed then connect(bullets.HitConfirmed,function(_,damage,critical,position)manager.emit('hit_confirmed',{damage=damage>0 and damage or nil,critical=critical==true,position=position})end)end
+  end
+ end
+ return bridge
+end
+
+end)()
+
+local installScriptUI = (function()
+-- Script library, source editor, settings, logs, and local API documentation.
+return function(host)
+ local M={};local manager=host.manager
+ local frame,text,create=host.frame,host.text,host.create
+ local Controls,Theme,Fonts=host.Controls,host.Theme,host.Fonts
+ local listConnections={};local drafts={};local closed=false;local settingsName
+ local function ui(fn,...)
+  local prior=getthreadidentity and getthreadidentity();if setthreadidentity then setthreadidentity(8)end
+  local result=table.pack(pcall(fn,...));if setthreadidentity and prior then setthreadidentity(prior)end
+  if not result[1]then error(result[2],0)end;return table.unpack(result,2,result.n)
+ end
+ local function bind(list,signal,fn)local c=signal:Connect(fn);list[#list+1]=c;return c end
+ local function clear(list)for i=#list,1,-1 do pcall(function()list[i]:Disconnect()end);list[i]=nil end end
+ local function action(fn)
+  return function(...)local ok,err=pcall(fn,...);if not ok then host.notify('Lua',tostring(err),'error')end end
+ end
+ local function button(parent,label,x,y,width,fn,connections)
+  local b,hit=Controls.button(parent,label,nil,width,24);b.Position=UDim2.fromOffset(x,y)
+  bind(connections,hit.MouseButton1Click,action(fn));return b
+ end
+ local function dialog(title)
+  host.closePopup();local connections={};local released=false
+  local panel=frame({Name='LuaDialog',AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromScale(.5,.5),Size=UDim2.fromOffset(680,490),BackgroundColor3=Theme.Group,Parent=host.popupLayer})
+  create('UICorner',{CornerRadius=UDim.new(0,5),Parent=panel});create('UIStroke',{Color=Theme.FieldStroke,Thickness=1,Parent=panel})
+  text({Text=title,FontFace=Fonts.Bold,TextSize=15,TextColor3=Theme.Title,TextTruncate=Enum.TextTruncate.AtEnd,Position=UDim2.fromOffset(14,8),Size=UDim2.fromOffset(580,24),Parent=panel})
+  button(panel,'Close',608,9,58,host.closePopup,connections)
+  local releaseExtra
+  host.pushPopup(panel,host.page,function()
+   if released then return end;released=true;if releaseExtra then releaseExtra()end;clear(connections);panel:Destroy()
+  end)
+  return panel,connections,function(fn)releaseExtra=fn end
+ end
+ local function editorArea(panel,source,editable,connections)
+  local sc=create('ScrollingFrame',{Name='CodeScroll',Position=UDim2.fromOffset(12,76),Size=UDim2.fromOffset(656,370),BackgroundColor3=Theme.Field,BorderSizePixel=0,
+   ScrollBarThickness=5,ScrollBarImageColor3=Theme.FieldStroke,CanvasSize=UDim2.new(),ScrollingDirection=Enum.ScrollingDirection.XY,Parent=panel})
+  local code=create('TextBox',{Name='Source',Text=source,Font=Enum.Font.Code,TextSize=13,TextColor3=Theme.Title,BackgroundTransparency=1,
+   TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false,MultiLine=true,ClearTextOnFocus=false,
+   TextEditable=editable,Position=UDim2.fromOffset(10,8),Size=UDim2.fromOffset(630,354),Parent=sc})
+  local function size()
+   local count,longest=1,0;for line in (code.Text..'\n'):gmatch('(.-)\n')do count=count+1;longest=math.max(longest,#line)end
+   local width=math.max(630,math.min(32000,longest*8+24));local height=math.max(354,count*17+16)
+   code.Size=UDim2.fromOffset(width,height);sc.CanvasSize=UDim2.fromOffset(width+22,height+16)
+  end
+  bind(connections,code:GetPropertyChangedSignal('Text'),size);size();return code
+ end
+ function M.edit(name)
+  return ui(function()
+   local source=manager.read(name);local panel,connections,onClose=dialog('Lua editor · '..name)
+   local code=editorArea(panel,drafts[name]or source,true,connections)
+   local status=text({Text='Save writes the file. Save & Reload also restarts it.',TextSize=12,TextColor3=Theme.Value,Position=UDim2.fromOffset(14,454),Size=UDim2.fromOffset(650,24),TextTruncate=Enum.TextTruncate.AtEnd,Parent=panel})
+   local function save()manager.save(name,code.Text);source=code.Text;drafts[name]=nil;status.Text='Saved '..name end
+   button(panel,'Save',12,42,74,save,connections)
+   button(panel,'Save & Reload',94,42,126,function()save();local ok,err=manager.reload(name);status.Text=ok and 'Restarting '..name or tostring(err)end,connections)
+   button(panel,'Check syntax',228,42,108,function()local ok,err=manager.check(code.Text,name);status.Text=ok and 'Syntax is valid.'or tostring(err)end,connections)
+   button(panel,'Copy',344,42,66,function()assert(type(setclipboard)=='function','clipboard is unavailable');setclipboard(code.Text);status.Text='Source copied.'end,connections)
+   bind(connections,code:GetPropertyChangedSignal('Text'),function()status.Text=code.Text==source and 'Saved '..name or 'Unsaved draft · closing keeps it until this menu unloads.'end)
+   onClose(function()if code.Text~=source then drafts[name]=code.Text else drafts[name]=nil end end)
+  end)
+ end
+ local function viewer(title,body)
+  local panel,connections=dialog(title);editorArea(panel,body,false,connections)
+  button(panel,'Copy all',12,42,90,function()assert(type(setclipboard)=='function','clipboard is unavailable');setclipboard(body);host.notify('Lua','Copied to clipboard.')end,connections)
+  text({Text='Select text to copy, or use Copy all.',TextSize=12,TextColor3=Theme.Value,Position=UDim2.fromOffset(14,454),Size=UDim2.fromOffset(650,24),Parent=panel})
+ end
+ function M.docs()return ui(function()viewer('NEVERLOSE · Lua API v1',host.docs)end)end
+ function M.logs(name)
+  return ui(function()
+   local lines={};for _,entry in ipairs(manager.logs(name))do lines[#lines+1]=os.date('%H:%M:%S',entry.time)..' ['..entry.level..'] '..entry.message end
+   viewer('Lua logs · '..name,#lines>0 and table.concat(lines,'\n')or 'No log entries yet. Load the script to begin.')
+  end)
+ end
+ function M.settings(name)
+  return ui(function()
+   local groups=manager.controls(name);if #groups==0 then host.notify('Lua','Load this script first. Its ui.create groups will appear here.');return end
+   local panel,connections,onClose=dialog('Lua settings · '..name);local subscriptions={};settingsName=name
+   text({Text='Changes are saved separately for this script.',TextSize=12,TextColor3=Theme.Value,Position=UDim2.fromOffset(14,42),Size=UDim2.fromOffset(640,24),Parent=panel})
+   local sc=create('ScrollingFrame',{Position=UDim2.fromOffset(12,76),Size=UDim2.fromOffset(656,398),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,
+    AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new(),ScrollingDirection=Enum.ScrollingDirection.Y,Parent=panel})
+   create('UIListLayout',{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,4),Parent=sc})
+   local index=0
+   for _,group in ipairs(groups)do
+    index=index+1;text({Text=group.name,FontFace=Fonts.Bold,TextColor3=Theme.Title,TextSize=14,Size=UDim2.new(1,-12,0,28),LayoutOrder=index,Parent=sc})
+    for _,item in ipairs(group.items)do
+     index=index+1;local row=frame({Name=item.label,Size=UDim2.new(1,-12,0,31),BackgroundTransparency=1,LayoutOrder=index,Visible=item.visible,Parent=sc})
+     local label=text({Text=item.label,TextSize=13,TextColor3=Theme.Label,TextTruncate=Enum.TextTruncate.AtEnd,Position=UDim2.fromOffset(8,0),Size=UDim2.new(1,-220,1,0),Parent=row})
+     local apply=function()end
+     local function set(value)local ok,err=pcall(item.set,item,value);if not ok then host.notify('Lua control',tostring(err),'error')end end
+     local control
+     if item.kind=='switch'then control,apply=Controls.switch(row,set)
+     elseif item.kind=='slider'then control,apply=Controls.slider(row,{min=item.min,max=item.max,step=item.step,default=item:get()},set)
+     elseif item.kind=='combo'or item.kind=='selectable'then control,apply=Controls.dropdown(row,{options=item.options,default=item:get(),multi=item.kind=='selectable',width=185},set)
+     elseif item.kind=='color'then control,apply=Controls.color(row,set)
+     elseif item.kind=='hotkey'then control,apply=Controls.keybind(row,set)
+     elseif item.kind=='input'then
+      local box;control,box=Controls.input(row,{Size=UDim2.fromOffset(200,24),text=item:get(),textSize=12})
+      apply=function(value)if not box:IsFocused()then box.Text=value end end;bind(connections,box.FocusLost,function()set(box.Text)end)
+     elseif item.kind=='button'then local hit;control,hit=Controls.button(row,item.label,nil,180,24);bind(connections,hit.MouseButton1Click,function()item:press()end)
+     elseif item.kind=='label'then label.Size=UDim2.new(1,-16,1,0);apply=function(value)label.Text=value end end
+     if control then control.AnchorPoint=Vector2.new(1,.5);control.Position=UDim2.new(1,-8,.5,0)end
+     apply(item:get())
+     subscriptions[#subscriptions+1]=item:set_callback(function(ref)ui(function()if row.Parent then row.Visible=ref.visible;apply(ref:get())end end)end)
+    end
+   end
+   onClose(function()settingsName=nil;for _,sub in ipairs(subscriptions)do sub:Disconnect()end end)
+  end)
+ end
+ function M.refresh()
+  if closed then return end
+  return ui(function()
+   if settingsName and #manager.controls(settingsName)==0 then host.closePopup()end
+   clear(listConnections);local inner=host.clearList(host.page)
+   local bar=frame({Name='LuaTools',Size=UDim2.new(1,0,0,60),BackgroundColor3=Theme.Group,LayoutOrder=0,Parent=inner})
+   text({Text='Lua API v1',FontFace=Fonts.Bold,TextColor3=Theme.Title,TextSize=14,Position=UDim2.fromOffset(12,7),Size=UDim2.fromOffset(260,20),Parent=bar})
+   text({Text='Local scripts · game events · custom controls',TextColor3=Theme.Value,TextSize=12,Position=UDim2.fromOffset(12,30),Size=UDim2.fromOffset(360,20),Parent=bar})
+   button(bar,'Docs',400,17,76,M.docs,listConnections);button(bar,'Refresh',484,17,90,M.refresh,listConnections)
+   local entries=manager.list(host.order())
+   if #entries==0 then host.emptyNote(inner,'Press Create, or add .lua/.luau files to workspace/neverlose_ui/scripts.');return end
+   for i,entry in ipairs(entries)do
+    local state=entry.phase=='error'and 'Error' or entry.phase=='loading'and 'Loading' or entry.loaded and 'Loaded' or 'Unloaded'
+    local card=host.listCard(inner,i,{title=entry.name,meta={'Status:',state,'Lines:',tostring(entry.lines)},height=100,connect=function(signal,fn)return bind(listConnections,signal,fn)end,
+     loaded=entry.loaded,buttonText=entry.loaded and 'Unload'or 'Load',onLoad=action(function()if entry.loaded then manager.unload(entry.name)else local ok,err=manager.load(entry.name);if not ok then error(err,0)end end end),
+     onRename=action(function(name)manager.rename(entry.name,name)end),onCopy=action(function()manager.duplicate(entry.name)end),
+     onShare=action(function()assert(type(setclipboard)=='function','clipboard is unavailable');setclipboard(manager.read(entry.name));host.notify('Copied',entry.name..' source copied.')end),
+     onDelete=action(function()drafts[entry.name]=nil;manager.delete(entry.name)end)})
+    button(card,'Edit',12,64,58,function()M.edit(entry.name)end,listConnections)
+    button(card,'Reload',78,64,66,function()local ok,err=manager.reload(entry.name);if not ok then error(err,0)end end,listConnections)
+    button(card,'Settings',152,64,78,function()M.settings(entry.name)end,listConnections)
+    button(card,'Logs',238,64,58,function()M.logs(entry.name)end,listConnections)
+    text({Text='Auto load',TextSize=12,TextColor3=Theme.Value,Position=UDim2.new(1,-121,0,66),Size=UDim2.fromOffset(74,22),Parent=card})
+    local sw,apply=Controls.switch(card,action(function(value)manager.autoload(entry.name,value)end));sw.Position=UDim2.new(1,-12,0,77);apply(entry.autoload)
+   end
+  end)
+ end
+ function M.create(name)local created=manager.create(name);M.refresh();M.edit(created)end
+ function M.destroy()closed=true;clear(listConnections);drafts={}end
+ M.refresh();return M
+end
+
+end)()
+
+local SCRIPT_ASSETS = {docs=[==[
+# NEVERLOSE for RIVALS — Lua API v1
+
+This is a client Lua/Luau extension API for this menu and its RIVALS adapter. It uses Neverlose-style namespaces, event subscriptions, and menu groups, with implementations for capabilities available in this client. Existing CSGO Neverlose scripts require porting; their engine-specific functions are not emulated.
+
+## Start here
+
+1. Open the menu with Delete and select Miscellaneous → Scripts.
+2. Press Create, enter a filename, and edit the starter script. `.lua` and `.luau` are supported.
+3. Press Check syntax, then Save & Reload. Save alone writes the file without restarting it.
+4. Use Settings on its card for controls created by `ui.create`. Use Logs for print output and errors.
+5. Unload stops the script and cleans its managed resources. Reload unloads it before starting a fresh instance.
+
+The Docs button opens this reference inside the menu. Refresh rescans the script folder. The card icons rename, copy source, duplicate, and delete; deletion still requires the existing second click. Renaming a loaded script unloads and restarts it under its new filename. Duplicate scripts start with independent data and autoload disabled.
+
+Files live in your executor's `workspace/neverlose_ui/scripts/`. You can edit them in another editor and press Reload. The supplied examples are `hud_example.lua`, `event_logger.lua`, and `native_hook_example.lua`; they are installed only if that filename does not already exist. They do not run automatically.
+
+The editor keeps unsaved drafts in memory when closed. Save them before unloading or reloading the menu. Check syntax compiles the source without executing it.
+
+Auto load is separate for each script and starts it after the menu and its public API initialize. It persists across menu reloads. On another server, it applies when the menu starts there; enable the menu's Auto Execute if you want that startup to happen automatically. It does not install executor startup software.
+
+## First script
+
+```lua
+local group = ui.create('My script')
+local enabled = group:switch('Enabled', true)
+local message = group:input('Message', 'Hello from Lua')
+
+group:button('Notify', function()
+    if enabled:get() then menu.notify('My script', message:get()) end
+end)
+
+events.menu_changed:set(function(open)
+    print('Menu open:', open)
+end)
+
+script.on_unload(function()
+    print('Goodbye')
+end)
+```
+
+Every chunk also receives its API as its first argument: `local nl = ...`. The same object is the script-local global `neverlose`. Use either `nl.events.render:set(fn)` or `events.render:set(fn)`.
+
+## Lifecycle and resources
+
+- `script.name`, `script.filename`, `script.api_version`: script identity and API version.
+- `script.is_loaded()`: whether this instance remains active.
+- `script.cleanup(resource)`: register a cleanup function, connection, Instance, or Drawing object. Cleanup calls a function or its Disconnect/Destroy/Remove method.
+- `script.on_unload(fn)`: register a callback run on manual unload, reload, deletion, errors, or menu unload. Returns a disconnectable subscription.
+- `script.unload()`: unload this instance.
+- Returning a function from the chunk registers that function for cleanup.
+
+Managed event callbacks, method wrappers, custom-control callbacks, and managed tasks stop on unload. A runtime error stops the affected script and cleans its managed resources; it does not intentionally unload other scripts. Errors appear in Logs. Logs retain the latest 100 entries per script for this menu session.
+
+`print(...)` and `warn(...)` write to that script's Logs. They do not depend on the executor console being visible.
+
+Use `utils.connect(signal, fn)` instead of a raw `signal:Connect(fn)` to track the connection automatically. Use `script.cleanup(instance)` for Instances you create. Raw executor resources and globals are available for compatibility, but resources created directly through those globals require explicit cleanup. Scripts execute with executor privileges; this API is not a security sandbox.
+
+The script-local `task` table supports:
+
+- `task.spawn(fn, ...)` and `task.defer(fn, ...)`: tracked asynchronous tasks; both defer execution until a scheduler turn.
+- `task.delay(seconds, fn, ...)`: tracked one-shot timer.
+- `task.wait(seconds)`: ordinary Roblox task waiting.
+- `task.cancel(thread)`: cancel one of this script's tracked tasks.
+
+Avoid non-yielding infinite loops and yielding frame callbacks. No Lua API can reliably interrupt a non-yielding script that monopolizes the executor. Timers and spawned threads should use the supplied `task` table.
+
+## Events
+
+Subscribe with `events.NAME:set(fn)` or `events.NAME(fn)`. The returned handle has `:Disconnect()`. Remove a particular callback with `events.NAME:unset(fn)`. Multiple callbacks are supported. Unknown event names raise an error rather than silently subscribing to an event that cannot occur.
+
+| Event | Callback arguments | Meaning |
+| --- | --- | --- |
+| `render` | `dt` | Roblox RenderStepped; immediate drawing is valid here. |
+| `heartbeat` | `dt` | Roblox Heartbeat. |
+| `input_began` | `inputObject, gameProcessed` | Native UserInputService input. Respect typing/menu state when appropriate. |
+| `input_ended` | `inputObject, gameProcessed` | Native input release. |
+| `menu_changed` | `open` | Menu visibility transition, sampled at up to 10 Hz. |
+| `setting_changed` | `path, value` | A built-in menu setting changed. |
+| `local_character_changed` | `modelOrNil` | Native local entity model changed, sampled at up to 10 Hz. |
+| `weapon_changed` | `weaponOrNil` | Native equipped item object changed, sampled at up to 10 Hz. |
+| `shot_requested` | `weaponOrNil` | Before the native local StartShooting method. It may still reject the request. |
+| `shot_fired` | `weaponOrNil` | Native local weapon Shot event; it is not proof of server damage acceptance. |
+| `bullet_tracer` | `origin, direction` | Native local tracer data when that weapon emits a tracer. |
+| `hit_confirmed` | `hit` | Native hitmarker feedback. `hit.critical` is boolean; `hit.position` is optional; `hit.damage` is nil when damage is not exposed. |
+| `unload` | none | This script is being cleaned up. Equivalent to `script.on_unload`. |
+
+There is no synthetic `createmove`, server tick, packet acknowledgement, or player-damage event. Shot/tracer events are client observations with the limits above.
+
+## Custom menu controls
+
+`local group = ui.create('Group name')` creates a group inside this script's Settings panel. Names identify persistent values; keep group and control names stable across updates. Duplicate control names within a group raise an error.
+
+| Constructor | Value |
+| --- | --- |
+| `group:switch(label, default)` | boolean |
+| `group:slider(label, min, max, default, step)` | finite number, clamped and snapped to step; step defaults to 1 |
+| `group:combo(label, {'One', 'Two'})` | one choice string; first is the default |
+| `group:selectable(label, {'One', 'Two'})` | table of selected choice strings |
+| `group:input(label, default)` | string |
+| `group:hotkey(label, defaultKey)` | keyboard key name or Mouse1/Mouse2/Mouse3; defaults to None; check it with input.is_key_down(item:get()) |
+| `group:color_picker(label, '#69A7FF')` | `#RRGGBB` string; convert with Color3.fromHex for rendering |
+| `group:button(label, callback)` | invokes callback when pressed |
+| `group:label(text)` | text label; update with `:set(text)` |
+
+Combo/selectable constructors also accept individual choice strings. Their choices must be unique. Constructors return an item with `:get()`, `:set(value)`, `:set_callback(fn, immediate)`, and `:visibility([boolean])`. Control callbacks receive the item. `:set_callback` returns a disconnectable subscription and can call it immediately if the second argument is true. `:visibility()` reads visibility; passing a boolean changes it.
+
+Custom control values are saved per script, separately from built-in menu configs. Source is never overwritten when a script loads. Invalid stored values fall back to the control's declared default. Buttons, labels, and visibility are not persisted.
+
+```lua
+local g = ui.create('Options')
+local active = g:switch('Enabled', false)
+active:set_callback(function(item)
+    print('Enabled:', item:get())
+end, true)
+```
+
+## Built-in menu access
+
+- `menu.paths()`: sorted built-in setting paths.
+- `menu.get(path, context)` and `menu.set(path, value, context)`: read/change a built-in setting. The optional context uses the menu's existing weapon/player profiles.
+- `menu.onChanged(path, fn)` and `menu.onAnyChanged(fn)`: managed subscriptions.
+- `menu.notify(title, body)`: menu notification.
+- `menu.is_open()` and `ui.is_open()`: menu visibility.
+- `ui.find(path, context)`: built-in setting reference with `:get()`, `:set(value)`, and `:set_callback(fn, immediate)`. Its callbacks receive the reference.
+
+Built-in changes made with set remain after script unload. To restore a value, capture it and restore it in your cleanup callback. Avoid replacing an entire menu snapshot in a script cleanup because that could discard unrelated user changes. Unsupported setting paths raise errors.
+
+## Entities
+
+- `entity.get_local_player()`: native local entity wrapper, or nil when no model exists.
+- `entity.get_entities(options)`: current-environment entities. Options are `enemies_only`, `alive_only`, and `include_local` (all default false).
+- `entity.get_players(enemiesOnly, includeDead)`: convenience filter; excludes the local entity and excludes dead entities unless includeDead is true. Native training bots are included.
+- `entity.from_player(robloxPlayer)`: wrapper for a Roblox Player. Its model/hitboxes can be missing.
+
+Wrapper methods:
+
+`get_name()`, `get_player()` (nil for bots), `get_model()`, `get_origin()`, `get_velocity()`, `get_health()`, `get_max_health()`, `is_alive()`, `is_enemy()`, `get_team()`, `get_hitboxes()`, `get_hitbox_position('Head' or 'Body')`, and `get_weapon()`.
+
+Positions and velocities are Roblox Vector3 values. Missing models/parts return nil. Health uses native entity data, including infinite-health training targets. Hitboxes are the actual native Head/Body damage parts; they are not guessed limb names. Check for nil between spawns. Enemy filtering follows the adapter's environment/team rules.
+
+## Weapons, camera, and supported native hooks
+
+`rivals.capabilities()` returns booleans for `entities`, `weapon_data`, `camera_rotation`, `native_controllers`, `method_hooks`, `drawing`, `shot_events`, and `hit_events`. Check them before using optional functionality.
+
+`rivals.get_weapon()` returns a snapshot or nil. Exposed local fields, when present, are `name`, `ammo`, `max_ammo`, `aiming`, `reloading`, `type`, `class`, `is_raycast`, `shoot_damage`, `critical_damage`, and `shoot_cooldown`. Remote entity weapon snapshots have only the replicated name/ammo/max_ammo/aiming fields available. Snapshots do not grant inventory ownership or change server weapon rules.
+
+Camera functions: `camera.get_eye()` returns a CFrame, `camera.get_rotation()` returns Vector2(pitch, yaw), `camera.set_rotation(pitch, yaw)` changes the native local aiming camera, and `camera.get_fov()` reads the final camera FOV. Angles are radians; pitch is bounded to ±89.9 degrees and yaw wraps. FOV can be changed through the existing `World/View/Override FOV` setting. Camera writes require the supported native adapter.
+
+Advanced access:
+
+- `rivals.get_controller('FighterController' | 'CameraController' | 'MechanicsController')`: one of the three supported native controller tables.
+- `rivals.get_native_fighter()` and `rivals.get_native_weapon()`: current native objects or nil. Refresh these after weapon/character changes. Native methods and fields can change with game updates.
+- `rivals.is_input_blocked()`: the adapter's native weapon-input block check.
+- `hooks.wrap(object, 'Method', callback)`: managed wrapper for an existing Lua table method. The callback receives `nextCall` followed by the original arguments. Pass arguments through and preserve returned values when you do not intend to change behavior. Returns a handle with `:Disconnect()`.
+
+```lua
+local controller = rivals.get_controller('CameraController')
+hooks.wrap(controller, 'GetPublicState', function(nextCall, self, ...)
+    return nextCall(self, ...)
+end)
+```
+
+Wrappers compose across scripts and restore the original method owner when the final wrapper unloads. A wrapper may call next at most once. If it fails after the original ran, the manager does not invoke the original again. Do not directly replace the same method while managed wrappers are installed. Native object methods may require Roblox game identity; direct native work should preserve and restore the caller's identity. The supplied high-level data/camera calls handle that themselves.
+
+This is ordinary client Lua method wrapping. No binary detours, RakNet mutation, unavailable server handlers, seed prediction, tick shifting, desync, or historical-hit acceptance are supplied.
+
+## Input, traces, drawing, and time
+
+- `input.is_key_down('F' or Enum.KeyCode.F)`: keyboard key; Mouse1/Mouse2/Mouse3 strings are also supported.
+- `input.get_mouse_position()`: native mouse position as Vector2.
+- `input.is_typing()`: whether a TextBox has focus.
+- `utils.trace_line(from, to, raycastParams)`: workspace Raycast between two Vector3 positions; returns RaycastResult or nil.
+- `utils.is_visible(entityWrapper, 'Head' or 'Body')`: local eye-to-hitbox ray, excluding the local model/camera. It checks map/other-entity obstruction, not authoritative server visibility.
+- `utils.connect(signal, fn)`: tracked Roblox-style signal subscription.
+- `render.screen_size()`: camera viewport Vector2.
+- `render.world_to_screen(Vector3)`: Vector2 and onScreen boolean; position is nil if no camera exists.
+- `render.text(Vector2, Color3, text, size, centered)`.
+- `render.line(fromVector2, toVector2, Color3, thickness)`.
+- `render.rect(positionVector2, sizeVector2, Color3, filled)`; filled defaults true.
+- `render.circle(positionVector2, radius, Color3, filled, thickness)`.
+- `render.new('Text' | 'Line' | 'Square' | 'Circle' | other supported Drawing type)`: persistent raw Drawing object tracked for cleanup.
+
+The immediate text/line/rect/circle calls require `events.render`. Their per-frame objects are reused and hidden when no longer drawn. Drawing needs executor Drawing support; inspect the capability flag first. Raw render.new objects remain under your control until cleanup. The `vector(x,y,z)`, `vector2(x,y)`, and `color(r,g,b)` helpers construct Roblox Vector3, Vector2, and Color3 values. Colors use 0–255 channels. Standard Roblox constructors remain available.
+
+`globals.realtime()` is local os.clock time. `globals.curtime()` uses Workspace:GetServerTimeNow, an estimate of current server time rather than a rewind control. `globals.frametime()` is the latest render delta. There is no fabricated server tick count.
+
+## Storage and file locations
+
+`storage.get(key, default)`, `storage.set(key, value)`, and `storage.delete(key)` read/write this script's private JSON data. Keys are strings. Use JSON-compatible values: strings, finite numbers, booleans, and ordinary tables. Do not store Instances, functions, CFrames, Vector3, or Color3 objects directly; serialize their components yourself.
+
+| Location under executor workspace | Purpose |
+| --- | --- |
+| `neverlose_ui/scripts/*.lua` or `*.luau` | Source files |
+| `neverlose_ui/script_data/<filename>.json` | Custom-control values and storage |
+| `neverlose_ui/scripts_meta.json` | Modified dates and per-file autoload |
+| `neverlose_ui/script_docs/README.md` | This API reference |
+
+Filenames keep their extension as their identity: example.lua and example.luau are different scripts. Paths, traversal, invalid Windows filename characters, and case-only collisions are rejected by the library's file actions.
+
+The advanced host API is `getgenv().NeverloseMenu.scripts`: `list(order)`, `read(name)`, `check(source,name)`, `create(name,source)`, `save(name,source)`, `load(name)`, `unload(name)`, `reload(name)`, `autoload(name,boolean)`, `rename(name,newName)`, `duplicate(name)`, `delete(name)`, `logs(name)`, and `status()`. It also exposes `openEditor(name)`, `openSettings(name)`, `openLogs(name)`, and `openDocs()`. UI actions use the same manager. Source-file operations may raise filesystem errors. load/reload return a dispatch boolean and optional error; inspect the resulting card status/logs for asynchronous initialization errors.
+
+## Validation
+
+`python verify_scripts.py` checks lifecycle cleanup, task cancellation, script-local globals, callback errors, control/storage persistence, extension-safe file operations, composed hooks, exact inherited-method restoration, prevention of duplicate native calls after hook errors, rename/autoload persistence, and generated source/doc/example consistency.
+
+On the connected version-1076 client, a temporary extension read nine native entities, the local Head hitbox and camera/input/trace data. It received 47 render/heartbeat/signal callbacks and observed 950 native camera-method calls. Unload stopped all counters and ran cleanup. All three bundled examples loaded without errors. Native UI checks verified the documentation viewer, editable source, custom-settings panel, retained unsaved draft, and unchanged saved example source. The temporary extension was removed and the examples were unloaded. These checks fired no shots and do not establish server damage behavior. No visual screenshot comparison was available.
+]==],template=[==[
+-- Open this script's Settings panel to use its controls.
+local group = ui.create('My script')
+local enabled = group:switch('Enabled', true)
+local message = group:input('Message', 'Hello from Lua')
+
+group:button('Notify', function()
+    if enabled:get() then menu.notify(script.name, message:get()) end
+end)
+
+events.menu_changed:set(function(open)
+    print('Menu open:', open)
+end)
+
+script.on_unload(function()
+    print('Script unloaded')
+end)
+
+print('Loaded', script.filename, 'with Lua API', script.api_version)
+]==],examples={
+["event_logger.lua"]=[==[
+-- Example 2: supported native game events and per-script storage.
+local group = ui.create('Event logger')
+local enabled = group:switch('Log events', true)
+local shots = tonumber(storage.get('shots', 0)) or 0
+local count = group:label('Shots recorded: ' .. tostring(shots))
+
+events.weapon_changed:set(function(weapon)
+    if enabled:get() then print('Weapon:', weapon and weapon.name or 'none') end
+end)
+
+events.shot_fired:set(function(weapon)
+    shots = shots + 1
+    storage.set('shots', shots)
+    count:set('Shots recorded: ' .. tostring(shots))
+    if enabled:get() then print('Local shot:', weapon and weapon.name or 'unknown') end
+end)
+
+events.hit_confirmed:set(function(hit)
+    if enabled:get() then
+        print('Hit feedback; critical:', hit.critical, 'damage:', hit.damage or 'not exposed')
+    end
+end)
+
+group:button('Reset counter', function()
+    shots = 0
+    storage.set('shots', 0)
+    count:set('Shots recorded: 0')
+end)
+]==],
+["hud_example.lua"]=[==[
+-- Example 1: native entity/weapon data, persistent controls, and managed rendering.
+local group = ui.create('HUD example')
+local enabled = group:switch('Enabled', true)
+local size = group:slider('Text size', 12, 28, 16)
+local tint = group:color_picker('Color', '#69A7FF')
+group:label('Edit these controls with the script card Settings button.')
+
+if not rivals.capabilities().drawing then
+    print('This executor does not expose Drawing; the HUD is unavailable.')
+    return
+end
+
+events.render:set(function()
+    if not enabled:get() then return end
+    local me = entity.get_local_player()
+    if not me or not me:is_alive() then return end
+    local weapon = rivals.get_weapon()
+    local message = string.format('%s | HP %s | %s', me:get_name(),
+        tostring(me:get_health()), weapon and weapon.name or 'No weapon')
+    render.text(vector2(24, 150), Color3.fromHex(tint:get()), message, size:get())
+end)
+
+script.on_unload(function()
+    print('HUD stopped; its drawings and callbacks are removed automatically.')
+end)
+]==],
+["native_hook_example.lua"]=[==[
+-- Example 3: wrap an existing native table method without changing its result.
+-- There are no fabricated CSGO commands or packet APIs in this scripting layer.
+local group = ui.create('Native hook example')
+local label = group:label('Calls observed: 0')
+local calls = 0
+local elapsed = 0
+
+if not rivals.capabilities().native_controllers then
+    print('This client build does not expose the supported native controllers.')
+    return
+end
+
+local cameraController = rivals.get_controller('CameraController')
+hooks.wrap(cameraController, 'GetPublicState', function(nextCall, self, ...)
+    calls = calls + 1
+    return nextCall(self, ...)
+end)
+
+events.heartbeat:set(function(dt)
+    elapsed = elapsed + dt
+    if elapsed >= 1 then
+        elapsed = 0
+        label:set('Calls observed: ' .. tostring(calls))
+    end
+end)
+
+-- The exact original method owner is restored when the last managed wrapper unloads.
+]==],
+}}
+
 local function main()
 	if setthreadidentity then setthreadidentity(8) end
 	loadIcons()
@@ -5943,7 +6935,7 @@ local function main()
 		if #history > 30 then
 			table.remove(history)
 		end
-		if getValue("Main/Interface/Notifications") == false then
+		if getValue("Main/Interface/Notifications") == false and kind ~= "welcome" then
 			return
 		end
 		toastOrder += 1
@@ -5995,7 +6987,7 @@ local function main()
 			})
 		end
 		tween(card, 0.2, { GroupTransparency = 0 })
-		task.delay(4, function()
+		task.delay(kind == "welcome" and 8 or 4, function()
 			if card.Parent then
 				tween(card, 0.35, { GroupTransparency = 1 })
 				task.wait(0.4)
@@ -6357,9 +7349,10 @@ local function main()
 
 	-- a card in the Scripts / Configs lists
 	local function listCard(parent, order, info)
+		local connect = info.connect or connect
 		local card = frame({
 			Name = info.title,
-			Size = UDim2.new(1, 0, 0, 54),
+			Size = UDim2.new(1, 0, 0, info.height or 54),
 			BackgroundColor3 = Theme.Group,
 			LayoutOrder = order,
 			Parent = parent,
@@ -6388,9 +7381,9 @@ local function main()
 			Size = UDim2.fromOffset(330, 16),
 			Parent = card,
 		})
-		local btn, btnHit = Controls.button(card, info.loaded and info.loadedText or "Load", info.loaded and "check" or "play", 82, 24, info.loaded and "dim" or nil)
+		local btn, btnHit = Controls.button(card, info.buttonText or (info.loaded and info.loadedText or "Load"), info.loaded and "check" or "play", 82, 24, info.loaded and "dim" or nil)
 		btn.AnchorPoint = Vector2.new(1, 0.5)
-		btn.Position = UDim2.new(1, -12, 0.5, 0)
+		btn.Position = UDim2.new(1, -12, 0, 27)
 		connect(btnHit.MouseButton1Click, info.onLoad)
 
 		local x = -12 - 82 - 16
@@ -6404,7 +7397,7 @@ local function main()
 			local hb = hitbox({
 				Name = a[2],
 				AnchorPoint = Vector2.new(1, 0.5),
-				Position = UDim2.new(1, x, 0.5, 0),
+				Position = UDim2.new(1, x, 0, 27),
 				Size = UDim2.fromOffset(18, 18),
 				Parent = card,
 			})
@@ -6450,7 +7443,7 @@ local function main()
 						padding = 4,
 					})
 					box:CaptureFocus()
-					box.FocusLost:Connect(function(enter)
+					connect(box.FocusLost, function(enter)
 						local newName = box.Text
 						box.Parent:Destroy()
 						nameLabel.Visible = true
@@ -6908,12 +7901,12 @@ local function main()
 		})
 		local hint
 		if isDiscord then
-			btn:SetAttribute("Invite", "https://discord.gg/neverlose-rivals")
+			btn:SetAttribute("Invite", "https://discord.gg/neverloserivals")
 			btn.BackgroundColor3 = Theme.NavActive
 			corner(4).Parent = btn
 			hint = text({Name="DiscordHint",Text="Open Discord invite",TextSize=11,TextColor3=Theme.Label,TextXAlignment=Enum.TextXAlignment.Right,AnchorPoint=Vector2.new(1,0),Position=UDim2.fromOffset(CONTENT_W-125,53),Size=UDim2.fromOffset(160,14),Visible=false,Parent=header})
 			connect(btn.MouseButton1Click, function()
-				local invite = "https://discord.gg/neverlose-rivals"
+				local invite = "https://discord.gg/neverloserivals"
 				local opened = false
 				local open = openurl or open_url
 				if type(open) == "function" then
@@ -6927,7 +7920,7 @@ local function main()
 				if opened then return end
 				local copy = setclipboard or toclipboard
 				if type(copy) == "function" and pcall(copy, invite) then
-					notify("Discord", "Browser opening is blocked. Invite copied: discord.gg/neverlose-rivals")
+					notify("Discord", "Browser opening is blocked. Invite copied: discord.gg/neverloserivals")
 				else
 					local box
 					openPanel(btn, "Discord invite", 310, function(rows)
@@ -7324,162 +8317,34 @@ local function main()
 	end
 
 	---------------------------------------------------------------------------------------
-	-- Scripts (workspace/neverlose_ui/scripts/*.lua): Load runs them with the menu API
+	-- Managed Lua extensions. The runtime starts only after the public menu API is ready.
 	---------------------------------------------------------------------------------------
-	local SCRIPT_DIR = ROOT .. "/scripts"
-	local SCRIPT_META = ROOT .. "/scripts_meta.json"
-	ensureFolder(SCRIPT_DIR)
-	local scriptMeta = readJson(SCRIPT_META) or {}
-	local function saveScriptMeta()
-		writefile(SCRIPT_META, HttpService:JSONEncode(scriptMeta))
-	end
-	local function scriptFile(name)
-		return SCRIPT_DIR .. "/" .. name .. ".lua"
-	end
-	local loadedScripts = {}
-
-	local SCRIPT_TEMPLATE = [[
--- %s
--- Scripts in workspace/neverlose_ui/scripts appear on the Scripts page; press Load to run.
--- The menu API is available as getgenv().NeverloseMenu.
-local menu = getgenv().NeverloseMenu
-
-menu.notify("%s", "Script loaded")
-
--- react to a setting (paths are "Page/Group/Label")
-menu.onChanged("World/Ambience/Night Mode", function(on)
-	print("Night mode:", on)
-end)
-
--- read a value at any time
-print("Watermark is", menu.get("Main/Interface/Watermark") and "on" or "off")
-]]
-
+	local scriptUI
+	rebuildScripts = function() if scriptUI then scriptUI.refresh() end end
 	createScript = function(name)
-		name = sanitize(name)
-		if not name then
-			notify("Script", "Enter a name first.", "error")
-			return
-		end
-		if not isfile(scriptFile(name)) then
-			writefile(scriptFile(name), string.format(SCRIPT_TEMPLATE, name, name))
-		end
-		scriptMeta[name] = os.time()
-		saveScriptMeta()
-		notify("Script created", "workspace/" .. scriptFile(name))
-		rebuildScripts()
+		if scriptUI then scriptUI.create(name) else notify("Lua", "The script system is starting.") end
 	end
-
-	local function listScripts()
-		local out = {}
-		for _, f in ipairs(listfiles(SCRIPT_DIR)) do
-			local name, ext = f:match("([^/\\]+)%.(luau?)$")
-			if name then
-				local ok, src = pcall(readfile, f)
-				table.insert(out, {
-					name = name,
-					file = f,
-					modified = scriptMeta[name] or 0,
-					lines = ok and select(2, src:gsub("\n", "\n")) + 1 or 0,
-					ext = ext,
-				})
-			end
-		end
-		table.sort(out, function(a, b)
-			if listSort.scripts == "By date" then
-				return a.modified > b.modified
-			end
-			return a.name:lower() < b.name:lower()
-		end)
-		return out
-	end
-
-	local function runScript(entry)
-		local ok, src = pcall(readfile, entry.file)
-		if not ok then
-			notify("Script", "Couldn't read " .. entry.name, "error")
-			return
-		end
-		local fn, err = loadstring(src, "=" .. entry.name)
-		if not fn then
-			notify("Script error", tostring(err), "error")
-			return
-		end
-		loadedScripts[entry.name] = true
-		task.spawn(function()
-			local okRun, runErr = pcall(fn)
-			if not okRun then
-				notify("Script error", entry.name .. ": " .. tostring(runErr), "error")
-			end
-		end)
-		notify("Script loaded", entry.name)
-		rebuildScripts()
-	end
-
-	rebuildScripts = function()
-		local inner = clearList(pages.scripts)
-		local list = listScripts()
-		if #list == 0 then
-			emptyNote(inner, "No scripts yet. Press Create, or drop .lua files into workspace/neverlose_ui/scripts.")
-			return
-		end
-		for i, entry in ipairs(list) do
-			listCard(inner, i, {
-				title = entry.name,
-				meta = {
-					"Modified:",
-					entry.modified > 0 and os.date("%d.%m %H:%M", entry.modified) or "-",
-					"Lines:",
-					tostring(entry.lines),
-				},
-				loaded = loadedScripts[entry.name],
-				loadedText = "Run",
-				onLoad = function()
-					runScript(entry)
-				end,
-				onRename = function(newName)
-					newName = sanitize(newName)
-					if not newName then
-						return
-					end
-					writefile(scriptFile(newName), readfile(entry.file))
-					delfile(entry.file)
-					scriptMeta[newName], scriptMeta[entry.name] = os.time(), nil
-					saveScriptMeta()
-					rebuildScripts()
-				end,
-				onShare = function()
-					if setclipboard then
-						setclipboard(readfile(entry.file))
-						notify("Copied", entry.name .. " source is on your clipboard.")
-					end
-				end,
-				onCopy = function()
-					local n = entry.name .. " copy"
-					while isfile(scriptFile(n)) do
-						n = n .. "+"
-					end
-					writefile(scriptFile(n), readfile(entry.file))
-					scriptMeta[n] = os.time()
-					saveScriptMeta()
-					rebuildScripts()
-				end,
-				onDelete = function()
-					delfile(entry.file)
-					scriptMeta[entry.name] = nil
-					saveScriptMeta()
-					notify("Script deleted", entry.name)
-					rebuildScripts()
-				end,
-			})
-		end
-	end
-
-	-- first run: drop an example in so the page isn't empty
-	if #listfiles(SCRIPT_DIR) == 0 then
-		writefile(scriptFile("example"), string.format(SCRIPT_TEMPLATE, "example", "Example script"))
-		scriptMeta.example = os.time()
-		saveScriptMeta()
+	local function initializeScripts()
+		local bridge = installScriptBridge(api, connect, cleanups)
+		api.scripts = installScriptRuntime(api, {
+			root = ROOT, docs = SCRIPT_ASSETS.docs, template = SCRIPT_ASSETS.template, examples = SCRIPT_ASSETS.examples,
+			buildContext = bridge.buildContext, capabilities = bridge.capabilities,
+			notify = notify, changed = function() if scriptUI then scriptUI.refresh() end end,
+		})
+		scriptUI = installScriptUI({
+			manager = api.scripts, page = pages.scripts, order = function() return listSort.scripts end,
+			docs = SCRIPT_ASSETS.docs, frame = frame, text = text, create = create,
+			Controls = Controls, Theme = Theme, Fonts = Fonts, notify = notify,
+			clearList = clearList, emptyNote = emptyNote, listCard = listCard,
+			popupLayer = popupLayer, pushPopup = pushPopup, closePopup = closePopup,
+		})
+		api.scripts.openEditor = scriptUI.edit
+		api.scripts.openDocs = scriptUI.docs
+		api.scripts.openSettings = scriptUI.settings
+		api.scripts.openLogs = scriptUI.logs
+		bridge.start(api.scripts)
+		table.insert(cleanups, function() api.scripts.destroy(); scriptUI.destroy() end)
+		api.scripts.startAutoload()
 	end
 
 	---------------------------------------------------------------------------------------
@@ -9065,7 +9930,11 @@ print("Watermark is", menu.get("Main/Interface/Watermark") and "on" or "off")
 	api._jobId = game.JobId
 	api.isAlive = function() return gui.Parent ~= nil and not gui:GetAttribute("Unloaded") end
 	api.autoexecute = installAutoExecute(api, connect, cleanups, env, ROOT, STARTUP_SOURCE)
+	initializeScripts()
 	env.NeverloseTeleportValues = nil
+	local welcomeKey = getValue(SETTINGS .. "/Menu Key")
+	if welcomeKey == "Delete" then welcomeKey = "DEL" end
+	notify("Welcome to NEVERLOSE", "Press " .. tostring(welcomeKey) .. " to open the menu.\nDon't forget to join the Discord!\ndiscord.gg/neverloserivals", "welcome")
 	return api
 end
 
