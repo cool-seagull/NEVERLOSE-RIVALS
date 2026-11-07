@@ -4648,6 +4648,268 @@ end
 
 end)()
 
+local installNickHider = (function()
+-- Local identity redaction. Original text is retained separately from rendered text.
+local NickText=(function()
+ local M={}
+ local function word(byte)return byte and(byte>=48 and byte<=57 or byte>=65 and byte<=90 or byte>=97 and byte<=122 or byte==95 or byte>=128)end
+ function M.tokens(values)
+  local result,seen={},{}
+  for _,value in ipairs(values)do if type(value)=='string'and value~=''then
+   local lower=value:lower();if not seen[lower]then seen[lower]=true;result[#result+1]=lower end
+  end end
+  table.sort(result,function(a,b)return #a>#b end);return result
+ end
+ local function matches(text,tokens)
+  local lower=text:lower();local result={};local cursor=1
+  while cursor<=#text do
+   local first,last
+   for _,token in ipairs(tokens)do
+    local at=cursor
+    while at<=#text do
+     local a,b=lower:find(token,at,true);if not a then break end
+     if not word(lower:byte(a-1))and not word(lower:byte(b+1))then
+      if not first or a<first or a==first and b>last then first,last=a,b end;break
+     end
+     at=b+1
+    end
+   end
+   if not first then break end
+   result[#result+1]={first,last};cursor=last+1
+  end
+  return result
+ end
+ function M.escape(value)return(value:gsub('&','&amp;'):gsub('<','&lt;'):gsub('>','&gt;'))end
+ local entities={amp='&',lt='<',gt='>',quot='"',apos="'"}
+ local function entity(value)
+  local key=value:sub(2,-2);if entities[key]then return entities[key]end
+  local code=key:match('^#(%d+)$');code=code and tonumber(code)or tonumber(key:match('^#[xX](%x+)$')or '',16)
+  if code and code>=0 and code<=1114111 and not(code>=55296 and code<=57343)then local ok,ch=pcall(utf8.char,code);if ok then return ch end end
+  return value
+ end
+ function M.mask(text,tokens,alias,rich)
+  if type(text)~='string'or text==''or #tokens==0 then return text,false end
+  if not rich then
+   local spans=matches(text,tokens);if #spans==0 then return text,false end
+   local out,cursor={},1;for _,span in ipairs(spans)do out[#out+1]=text:sub(cursor,span[1]-1);out[#out+1]=alias;cursor=span[2]+1 end
+   out[#out+1]=text:sub(cursor);return table.concat(out),true
+  end
+  -- Match visible text across rich-text formatting tags, preserving the tags and entities.
+  local pieces,visible={},{};local i,length=1,0
+  while i<=#text do
+   local rest=text:sub(i);local raw=rest:match('^</?[%a][^>]*>')
+   if raw then pieces[#pieces+1]={raw=raw};i=i+#raw
+   else
+    raw=rest:match('^&[#%w]+;')or text:sub(i,i);local value=raw:sub(1,1)=='&'and entity(raw)or raw
+    pieces[#pieces+1]={raw=raw,first=length+1,last=length+#value};visible[#visible+1]=value;length=length+#value;i=i+#raw
+   end
+  end
+  local spans=matches(table.concat(visible),tokens);if #spans==0 then return text,false end
+  local out,index={},1;alias=M.escape(alias)
+  for _,piece in ipairs(pieces)do
+   if not piece.first then out[#out+1]=piece.raw
+   else
+    while spans[index]and spans[index][2]<piece.first do index=index+1 end
+    local span=spans[index]
+    if span and piece.last>=span[1]and piece.first<=span[2]then if piece.first==span[1]then out[#out+1]=alias end
+    else out[#out+1]=piece.raw end
+   end
+  end
+  return table.concat(out),true
+ end
+ function M.alias(value,tokens)
+  value=tostring(value or ''):gsub('[%c]',' '):match('^%s*(.-)%s*$')
+  local ok,offset=pcall(utf8.offset,value,33);if ok and offset then value=value:sub(1,offset-1)elseif not ok then value=value:sub(1,32)end
+  local _,contains=M.mask(value,tokens,'',false)
+  if value~=''and not contains then return value end
+  for _,fallback in ipairs({'Anonymous','Hidden','Player'})do local _,found=M.mask(fallback,tokens,'',false);if not found then return fallback end end
+  return 'Hidden'
+ end
+ function M.random(rng,previous,tokens)
+  local alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+  for _=1,10 do
+   local length=rng:NextInteger(4,16);if previous and length==#previous then length=length==16 and 4 or length+1 end
+   local letters={};for i=1,length do local n=rng:NextInteger(1,#alphabet);letters[i]=alphabet:sub(n,n)end
+   local value=table.concat(letters);local _,contains=M.mask(value,tokens,'',false)
+   if not contains and value~=previous then return value end
+  end
+  return M.alias('Anonymous',tokens)
+ end
+ return M
+end)()
+
+return function(getValue,connect,cleanups,adapter,menuGui)
+ local Players=game:GetService('Players');local Run=game:GetService('RunService');local player=Players.LocalPlayer
+ local rng=Random.new();local enabled,stopped=false,false;local alias='Anonymous';local tokens={}
+ local objects,masked,roots,rootConnections={},{},{},{}
+ local drawings={};local nextAlias,nextPoll=0,0;local mode,fixed,interval
+ local state={phase='disabled',errors=0,masked=0,tracked=0,roots=0,drawings=0}
+ local function get(key)return getValue('Main/NickHider/'..key)end
+ local function identity(fn,...)
+  local prior=getthreadidentity and getthreadidentity();if setthreadidentity then setthreadidentity(8)end
+  local result=table.pack(pcall(fn,...));if setthreadidentity and prior then setthreadidentity(prior)end
+  if not result[1]then state.errors=state.errors+1;state.lastError=tostring(result[2]);return false,result[2]end
+  return table.unpack(result,1,result.n)
+ end
+ local function disconnectAll(list)for _,connection in ipairs(list)do pcall(function()connection:Disconnect()end)end;table.clear(list)end
+ local function ownHumanoid(object)
+  local model=object.Parent;if not model then return false end
+  return model==player.Character or adapter and adapter.character and model==adapter.character()or model.Name==player.Name
+ end
+ local function rich(object,property)return property~='DisplayName'and object.RichText==true end
+ local function update(record)
+  if record.writing or record.detached then return end
+  local object=record.object;local value=object[record.property]
+  if record.shown==nil or value~=record.shown then record.source=value end
+  local output,matched=record.source,false
+  if enabled then
+   output,matched=NickText.mask(record.source,tokens,alias,rich(object,record.property))
+   if record.property=='DisplayName'and record.source==''and ownHumanoid(object)then output,matched=alias,true end
+  end
+  record.shown=output;masked[record]=matched and true or nil
+  if value~=output then
+   record.writing=true;local ok,err=pcall(function()object[record.property]=output end);record.writing=false
+   if not ok then error(err,0)end
+  end
+ end
+ local function restore(record)
+  masked[record]=nil
+  if record.source==nil then return end
+  local current=record.object[record.property]
+  -- A game update newer than our last rendered value wins over the old snapshot.
+  if current==record.shown and current~=record.source then record.writing=true;record.object[record.property]=record.source;record.writing=false end
+ end
+ local function inScope(object)
+  for _,root in ipairs(roots)do if object==root or object:IsDescendantOf(root)then return true end end;return false
+ end
+ local function detach(object,putBack)
+  local entry=objects[object];if not entry then return end;objects[object]=nil
+  disconnectAll(entry.connections)
+  for _,record in pairs(entry.properties)do if putBack then identity(restore,record)else masked[record]=nil end end
+ end
+ local function watch(object)
+  if not enabled or objects[object]then return end
+  local label=object:IsA('TextLabel')or object:IsA('TextButton');local box=object:IsA('TextBox');local hum=object:IsA('Humanoid')
+  if not(label or box or hum)then return end
+  local entry={connections={},properties={}};objects[object]=entry
+  local function property(name)
+   if entry.properties[name]then return end
+   local record={object=object,property=name};entry.properties[name]=record
+   local ok=identity(function()
+    record.connection=object:GetPropertyChangedSignal(name):Connect(function()identity(update,record)end)
+    entry.connections[#entry.connections+1]=record.connection
+    update(record)
+   end)
+   if not ok then entry.properties[name]=nil;masked[record]=nil end
+  end
+  if hum then property('DisplayName')
+  elseif box then
+   property('PlaceholderText');if object.TextEditable==false then property('Text')end
+   entry.connections[#entry.connections+1]=object:GetPropertyChangedSignal('TextEditable'):Connect(function()identity(function()
+    local record=entry.properties.Text
+    if object.TextEditable==false then property('Text')elseif record then record.detached=true;record.connection:Disconnect();restore(record);entry.properties.Text=nil end
+   end)end)
+  else property('Text')end
+  if not hum then entry.connections[#entry.connections+1]=object:GetPropertyChangedSignal('RichText'):Connect(function()
+   for _,record in pairs(entry.properties)do identity(update,record)end
+  end)end
+  entry.connections[#entry.connections+1]=object.Destroying:Connect(function()detach(object,false)end)
+  entry.connections[#entry.connections+1]=object.AncestryChanged:Connect(function()if not inScope(object)then detach(object,true)end end)
+ end
+ local function attach(root)
+  if not root then return end
+  for _,existing in ipairs(roots)do if root==existing or root:IsDescendantOf(existing)then return end end
+  roots[#roots+1]=root
+  local ok,list=pcall(function()return root:GetDescendants()end)
+  if ok then for _,object in ipairs(list)do identity(watch,object)end end
+  rootConnections[#rootConnections+1]=root.DescendantAdded:Connect(function(object)identity(watch,object)end)
+ end
+ local function repaint()
+  local list={};for record in pairs(masked)do list[#list+1]=record end
+  for _,record in ipairs(list)do identity(update,record)end
+ end
+ local function stopWatching()
+  disconnectAll(rootConnections)
+  local list={};for object in pairs(objects)do list[#list+1]=object end
+  for _,object in ipairs(list)do detach(object,true)end
+  table.clear(roots);table.clear(masked)
+ end
+ local drawingUpdate
+ local function refresh()
+  if stopped then return end
+  local want=get('Enabled')==true;local newMode=get('Mode')or 'Obfuscated';local newFixed=tostring(get('Name')or 'Anonymous')
+  local newInterval=math.clamp(tonumber(get('Change Interval'))or .25,.1,2)
+  local changed=mode~=newMode or fixed~=newFixed or interval~=newInterval
+  mode,fixed,interval=newMode,newFixed,newInterval
+  if want~=enabled then
+   enabled=want;nextAlias=0
+   if enabled then
+    tokens=NickText.tokens({player.Name,player.DisplayName})
+    alias=mode=='Fixed Name'and NickText.alias(fixed,tokens)or NickText.random(rng,nil,tokens)
+    nextAlias=os.clock()+interval
+    attach(player:FindFirstChild('PlayerGui'));attach(game:GetService('CoreGui'))
+    local ok,hui=pcall(function()return gethui and gethui()or menuGui.Parent end);if ok then attach(hui)end
+    attach(workspace)
+   else stopWatching();for _,record in pairs(drawings)do drawingUpdate(record,true)end end
+  end
+  if enabled and(changed or mode~='Fixed Name'and os.clock()>=nextAlias)then
+   alias=mode=='Fixed Name'and NickText.alias(fixed,tokens)or NickText.random(rng,alias,tokens)
+   nextAlias=os.clock()+interval;repaint()
+  end
+  state.phase=enabled and 'active'or 'disabled'
+ end
+ drawingUpdate=function(record,restoreOnly)
+  local ok,value=pcall(function()return record.object.Text end);if not ok then drawings[record.object]=nil;return end
+  if record.shown==nil or value~=record.shown then record.source=value end
+  local output=record.source
+  if enabled and not restoreOnly then output=NickText.mask(record.source,tokens,alias,false)end
+  record.shown=output;if value~=output then pcall(function()record.object.Text=output end)end
+ end
+ local renderKey='NeverloseNickHider_'..game:GetService('HttpService'):GenerateGUID(false)
+ Run:BindToRenderStep(renderKey,Enum.RenderPriority.Last.Value+1,function()
+  if not enabled then return end
+  for _,record in pairs(drawings)do drawingUpdate(record)end
+ end)
+ connect(Run.Heartbeat,function()
+  if stopped or os.clock()<nextPoll then return end;nextPoll=os.clock()+.05
+  identity(refresh)
+ end)
+ connect(player:GetPropertyChangedSignal('DisplayName'),function()
+  if enabled then tokens=NickText.tokens({player.Name,player.DisplayName});nextAlias=0;identity(refresh);for _,entry in pairs(objects)do for _,record in pairs(entry.properties)do identity(update,record)end end end
+ end)
+ connect(player.ChildAdded,function(child)if enabled and child:IsA('PlayerGui')then identity(attach,child)end end)
+ local api={}
+ function api.mask(value,richText)
+  if not enabled then return value end
+  return NickText.mask(value,tokens,alias,richText==true)
+ end
+ function api.trackDrawing(object)
+  local record=drawings[object];if not record then record={object=object};drawings[object]=record;drawingUpdate(record)end
+  local removed=false
+  return function()if removed then return end;removed=true;if drawings[object]==record then drawingUpdate(record,true);drawings[object]=nil end end
+ end
+ function api.setDrawingText(object,value)
+  local record=drawings[object];if not record then record={object=object};drawings[object]=record end
+  record.source=tostring(value);record.shown=object.Text;drawingUpdate(record)
+ end
+ function api.refresh()return identity(refresh)end
+ function api.status()
+  local result=table.clone(state);result.enabled=enabled;result.mode=mode;result.alias=alias;result.masked=0;result.tracked=0;result.roots=#roots;result.drawings=0
+  for _ in pairs(masked)do result.masked=result.masked+1 end
+  for _ in pairs(objects)do result.tracked=result.tracked+1 end
+  for _ in pairs(drawings)do result.drawings=result.drawings+1 end
+  return result
+ end
+ table.insert(cleanups,function()
+  stopped=true;enabled=false;Run:UnbindFromRenderStep(renderKey);identity(stopWatching)
+  for _,record in pairs(drawings)do drawingUpdate(record,true)end;table.clear(drawings)
+ end)
+ identity(refresh)
+ return api
+end
+
+end)()
+
 local installScriptRuntime = (function()
 -- Managed client Lua extensions. This is a lifecycle boundary, not a security sandbox.
 return function(menu,opts)
@@ -5136,7 +5398,9 @@ return function(menu,connect,cleanups)
   local pool={};local cursors={};local inRender=false
   local function drawing(kind)
    assert(capabilities.drawing,'Drawing is unavailable in this executor');assert(record.active,'script is unloaded')
-   local object=Drawing.new(kind);record.track(function()pcall(function()object:Remove()end)end);return object
+   local object=Drawing.new(kind)
+   local release=kind=='Text'and menu.nickhider and menu.nickhider.trackDrawing(object)
+   record.track(function()if release then release()end;pcall(function()object:Remove()end)end);return object
   end
   function ctx.render.new(kind)return drawing(kind)end
   local function use(kind)
@@ -5148,7 +5412,9 @@ return function(menu,connect,cleanups)
   record.beforeRender=function()inRender=true;table.clear(cursors)end
   record.afterRender=function()inRender=false;for kind,list in pairs(pool)do for i=(cursors[kind]or 0)+1,#list do list[i].Visible=false end end end
   function ctx.render.text(position,color,text,size,center)
-   local d=use('Text');d.Position=position;d.Color=color;d.Text=tostring(text);d.Size=size or 14;d.Center=center==true;d.Outline=true;d.Font=2;return d.TextBounds
+   local d=use('Text');d.Position=position;d.Color=color
+   if menu.nickhider then menu.nickhider.setDrawingText(d,text)else d.Text=tostring(text)end
+   d.Size=size or 14;d.Center=center==true;d.Outline=true;d.Font=2;return d.TextBounds
   end
   function ctx.render.line(from,to,color,thickness)local d=use('Line');d.From=from;d.To=to;d.Color=color;d.Thickness=thickness or 1 end
   function ctx.render.rect(position,size,color,filled)local d=use('Square');d.Position=position;d.Size=size;d.Color=color;d.Filled=filled~=false;d.Thickness=1 end
@@ -5503,7 +5769,7 @@ This is ordinary client Lua method wrapping. No binary detours, RakNet mutation,
 - `render.circle(positionVector2, radius, Color3, filled, thickness)`.
 - `render.new('Text' | 'Line' | 'Square' | 'Circle' | other supported Drawing type)`: persistent raw Drawing object tracked for cleanup.
 
-The immediate text/line/rect/circle calls require `events.render`. Their per-frame objects are reused and hidden when no longer drawn. Drawing needs executor Drawing support; inspect the capability flag first. Raw render.new objects remain under your control until cleanup. The `vector(x,y,z)`, `vector2(x,y)`, and `color(r,g,b)` helpers construct Roblox Vector3, Vector2, and Color3 values. Colors use 0–255 channels. Standard Roblox constructors remain available.
+The immediate text/line/rect/circle calls require `events.render`. Their per-frame objects are reused and hidden when no longer drawn. Drawing needs executor Drawing support; inspect the capability flag first. Raw render.new objects remain under your control until cleanup. Text created through this API integrates with Main → NickHider; its rendered name references are redacted while the original underlying text is retained for restoration. The `vector(x,y,z)`, `vector2(x,y)`, and `color(r,g,b)` helpers construct Roblox Vector3, Vector2, and Color3 values. Colors use 0–255 channels. Standard Roblox constructors remain available.
 
 `globals.realtime()` is local os.clock time. `globals.curtime()` uses Workspace:GetServerTimeNow, an estimate of current server time rather than a rewind control. `globals.frametime()` is the latest render delta. There is no fabricated server tick count.
 
@@ -7692,6 +7958,15 @@ local function main()
 				{ "toggle", "Watermark", true },
 				{ "toggle", "Keybind List", true },
 				{ "toggle", "Notifications", true },
+			},
+		},
+		{
+			title = "NickHider",
+			rows = {
+				{ "toggle", "Enabled", false },
+				{ "dropdown", "Mode", { "Obfuscated", "Fixed Name" }, 1 },
+				{ "input", "Name", "Anonymous" },
+				{ "slider", "Change Interval", { min = 0.1, max = 2, default = 0.25, step = 0.05, suffix = " s" } },
 			},
 		},
 		{
@@ -9930,6 +10205,7 @@ local function main()
 	api._jobId = game.JobId
 	api.isAlive = function() return gui.Parent ~= nil and not gui:GetAttribute("Unloaded") end
 	api.autoexecute = installAutoExecute(api, connect, cleanups, env, ROOT, STARTUP_SOURCE)
+	api.nickhider = installNickHider(getValue, connect, cleanups, gameAdapter, gui)
 	initializeScripts()
 	env.NeverloseTeleportValues = nil
 	local welcomeKey = getValue(SETTINGS .. "/Menu Key")
